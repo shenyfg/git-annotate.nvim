@@ -23,7 +23,6 @@ function M.annotate()
     print("Git annotate: No file associated with current buffer")
     return
   end
-  print("filename is " .. filename)
 
   -- Execute git blame with line-porcelain format for detailed info
   local blame = vim.fn.systemlist({ "git", "blame", "--line-porcelain", filename })
