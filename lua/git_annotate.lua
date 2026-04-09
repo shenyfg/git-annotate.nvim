@@ -1,178 +1,412 @@
 local M = {}
 
---- Opens a Git blame sidebar showing commit information for each line
---- Toggles the sidebar if it's already open
+--- 解析 git blame --line-porcelain 输出
+--- 每个 commit 块格式：
+---   <sha> <orig_line> <final_line> [<num_lines>]
+---   author <name>
+---   author-mail <email>
+---   author-time <unix_ts>
+---   author-tz <tz>
+---   committer ...
+---   summary <msg>
+---   filename <path>   ← 块的最后一行
+---   \t<line_content>  ← 实际代码行
+--- @param blame_output string[]
+--- @return {text: string, author_time: integer, sha: string}[]
+local function parse_blame(blame_output)
+	local annotations = {}
+	local current = {}
+
+	for _, line in ipairs(blame_output) do
+		-- commit 块首行：40位 sha + 行号信息
+		local sha = line:match("^(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x) ")
+		if sha then
+			current.sha = sha
+		end
+
+		local a = line:match("^author (.+)")
+		if a then
+			current.author = a
+		end
+
+		local t = line:match("^author%-time (%d+)")
+		if t then
+			current.author_time = tonumber(t)
+		end
+
+		-- filename 是每个 commit 块的最后一个字段行，之后紧跟代码行
+		-- 以 filename 为触发点记录一条 annotation
+		if line:match("^filename ") then
+			local author = current.author or "Unknown"
+			local author_time = current.author_time or 0
+			local date = os.date("%y/%m/%d", author_time)
+			table.insert(annotations, {
+				text = string.format("%s %s", date, author),
+				author_time = author_time,
+				sha = current.sha or "",
+			})
+			current = {}
+		end
+	end
+
+	return annotations
+end
+
+--- 根据时间戳计算渐变高亮
+--- @param annotations {text: string, author_time: integer}[]
+--- @param buf integer
+local function apply_highlights(annotations, buf)
+	local N = 12 -- 渐变色阶数
+
+	-- 计算时间范围（忽略未提交行 time=0）
+	local min_t, max_t
+	for _, ann in ipairs(annotations) do
+		local t = ann.author_time
+		if t > 0 then
+			if not min_t or t < min_t then
+				min_t = t
+			end
+			if not max_t or t > max_t then
+				max_t = t
+			end
+		end
+	end
+	min_t = min_t or 0
+	max_t = max_t or min_t
+
+	-- 配色方案：新提交暖橙色，越旧越冷越暗（IntelliJ 风格）
+	-- 新 (ratio=1): #7a4a1a fg=#f0c080  暖橙棕，高饱和
+	-- 旧 (ratio=0): #252830 fg=#606878  冷灰蓝，低饱和暗淡
+	for i = 1, N do
+		local ratio = (i - 1) / math.max(N - 1, 1)
+		-- bg: 冷灰蓝 #252830 → 暖橙棕 #7a4a1a
+		local bg_r = math.floor(0x25 + ratio * (0x7a - 0x25))
+		local bg_g = math.floor(0x28 + ratio * (0x4a - 0x28))
+		local bg_b = math.floor(0x30 + ratio * (0x1a - 0x30))
+		-- fg: 暗灰 #606878 → 亮橙 #f0c080，保持可读性
+		local fg_r = math.floor(0x60 + ratio * (0xf0 - 0x60))
+		local fg_g = math.floor(0x68 + ratio * (0xc0 - 0x68))
+		local fg_b = math.floor(0x78 + ratio * (0x80 - 0x78))
+		vim.api.nvim_set_hl(0, "GitAnnotateAge" .. i, {
+			bg = string.format("#%02x%02x%02x", bg_r, bg_g, bg_b),
+			fg = string.format("#%02x%02x%02x", fg_r, fg_g, fg_b),
+		})
+	end
+
+	local ns = vim.api.nvim_create_namespace("git_annotate")
+	for idx, ann in ipairs(annotations) do
+		local t = ann.author_time
+		if t > 0 then
+			local ratio = (max_t == min_t) and 1 or (t - min_t) / (max_t - min_t)
+			local bucket = math.min(N, math.floor(ratio * (N - 1)) + 1)
+			vim.api.nvim_buf_set_extmark(buf, ns, idx - 1, 0, {
+				end_row = idx,
+				end_col = 0,
+				hl_group = "GitAnnotateAge" .. bucket,
+				hl_eol = true,
+			})
+		end
+	end
+end
+
+--- 打开/关闭 Git annotate 侧边栏
 function M.annotate()
-  -- Clean up previous sync autocmds (for toggle functionality)
-  pcall(vim.api.nvim_del_augroup_by_name, "GitAnnotateSync")
+	-- 关闭已有的 annotate 侧边栏（toggle）
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		local b = vim.api.nvim_win_get_buf(w)
+		if vim.api.nvim_get_option_value("filetype", { buf = b }) == "gitannotate" then
+			vim.api.nvim_win_close(w, true)
+			return
+		end
+	end
 
-  -- Toggle: Close existing annotate sidebar if found
-  for _, w in ipairs(vim.api.nvim_list_wins()) do
-    local buf = vim.api.nvim_win_get_buf(w)
-    if vim.api.nvim_buf_get_option(buf, "filetype") == "gitannotate" then
-      pcall(vim.api.nvim_del_augroup_by_name, "GitAnnotateSync")
-      vim.api.nvim_win_close(w, true)
-      return
-    end
-  end
+	local bufnr = vim.api.nvim_get_current_buf()
+	local filename = vim.api.nvim_buf_get_name(bufnr)
+	if filename == "" then
+		vim.notify("Git annotate: No file associated with current buffer", vim.log.levels.WARN)
+		return
+	end
 
-  -- Get current file path
-  local bufnr = vim.api.nvim_get_current_buf()
-  local filename = vim.api.nvim_buf_get_name(bufnr)
-  if filename == "" then
-    print("Git annotate: No file associated with current buffer")
-    return
-  end
+	-- 执行 git blame
+	local blame_output = vim.fn.systemlist({ "git", "blame", "--line-porcelain", filename })
+	if vim.v.shell_error ~= 0 then
+		vim.notify("Git annotate: git blame failed\n" .. table.concat(blame_output, "\n"), vim.log.levels.ERROR)
+		return
+	end
 
-  -- Execute git blame with line-porcelain format for detailed info
-  local blame = vim.fn.systemlist({ "git", "blame", "--line-porcelain", filename })
-  if vim.v.shell_error ~= 0 then
-    print("Git annotate: git blame failed\n" .. table.concat(blame, "\n"))
-    return
-  end
+	local annotations = parse_blame(blame_output)
+	if #annotations == 0 then
+		vim.notify("Git annotate: no blame data", vim.log.levels.WARN)
+		return
+	end
 
-  -- Parse git blame output to extract author and timestamp info
-  local annotations = {}
-  local times = {} -- Store timestamps for color gradient calculation
-  local author, author_time, author_mail
+	-- 记录主窗口，用于 scrollbind 对齐
+	local main_win = vim.api.nvim_get_current_win()
+	local top = vim.fn.line("w0") + vim.wo.scrolloff
+	local current_line = vim.fn.line(".")
 
-  for _, line in ipairs(blame) do
-    -- Extract author name
-    local a = line:match("^author (.+)")
-    if a then
-      author = a
-    end
+	-- 在左侧创建侧边栏
+	vim.cmd.vsplit({ mods = { keepalt = true, split = "aboveleft" } })
+	local ann_win = vim.api.nvim_get_current_win()
+	local ann_buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_win_set_buf(ann_win, ann_buf)
 
-    -- Extract commit timestamp
-    local t = line:match("^author%-time (%d+)")
-    if t then
-      author_time = tonumber(t)
-    end
+	-- 填充内容
+	local lines = vim.tbl_map(function(a)
+		return a.text
+	end, annotations)
+	vim.api.nvim_buf_set_lines(ann_buf, 0, -1, false, lines)
 
-    -- Note: author-mail parsing is commented out but preserved
-    -- local am = line:match("^author%-mail <(.+)>")
-    -- if am then
-    --   author_mail = am
-    -- end
+	-- 自动宽度：取最长行宽 + 1
+	local max_width = 0
+	for _, l in ipairs(lines) do
+		max_width = math.max(max_width, vim.fn.strdisplaywidth(l))
+	end
+	vim.api.nvim_win_set_width(ann_win, max_width + 1)
 
-    -- Build annotation line when we have required info
-    if author and author_time and author_mail then
-      local date = os.date("%y/%m/%d", author_time)
-      table.insert(annotations, string.format("%s %s <%s>", date, author, author_mail))
-      table.insert(times, author_time)
-    elseif author and author_time then
-      local date = os.date("%y/%m/%d", author_time)
-      table.insert(annotations, string.format("%s %s", date, author))
-      table.insert(times, author_time)
-    else
-      goto continue
-    end
+	apply_highlights(annotations, ann_buf)
 
-    -- Reset variables for next line
-    author = nil
-    author_time = nil
-    author_mail = nil
-    ::continue::
-  end
+	-- buffer 属性
+	local bo = vim.bo[ann_buf]
+	bo.buftype = "nofile"
+	bo.bufhidden = "wipe"
+	bo.modifiable = false
+	bo.filetype = "gitannotate"
 
-  -- Store main window ID for scroll synchronization
-  local main_win = vim.api.nvim_get_current_win()
+	-- 窗口属性
+	local wlo = vim.wo[ann_win][0]
+	wlo.number = false
+	wlo.relativenumber = false
+	wlo.signcolumn = "no"
+	wlo.foldcolumn = "0"
+	wlo.foldenable = false
+	wlo.wrap = false
+	wlo.list = false
+	wlo.spell = false
+	wlo.winfixwidth = true
+	wlo.scrollbind = true -- 用 scrollbind 同步滚动，比手动 WinScrolled 更可靠
 
-  -- Create left sidebar split
-  vim.cmd("topleft vsplit")
-  local win = vim.api.nvim_get_current_win()
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(win, buf)
+	-- 对齐滚动位置
+	vim.cmd(tostring(top))
+	vim.cmd("normal! zt")
+	vim.cmd(tostring(current_line))
+	vim.cmd("normal! 0")
 
-  -- Populate buffer with annotation lines
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, annotations)
+	-- 主窗口也开启 scrollbind
+	local main_wlo = vim.wo[main_win][0]
+	local orig_scrollbind = main_wlo.scrollbind
+	local orig_wrap = main_wlo.wrap
+	main_wlo.scrollbind = true
+	main_wlo.wrap = false
 
-  -- Setup color gradient based on commit age
-  local N = 10 -- Number of gradient levels
+	vim.cmd.redraw()
+	vim.cmd.syncbind()
 
-  -- Find min/max timestamps (excluding uncommitted lines with time=0)
-  local min_t, max_t
-  for _, t in ipairs(times) do
-    if t > 0 then
-      if not min_t or t < min_t then min_t = t end
-      if not max_t or t > max_t then max_t = t end
-    end
-  end
-  min_t = min_t or 0
-  max_t = max_t or min_t
+	-- 关闭快捷键
+	vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
+	vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
 
-  -- Create gradient highlight groups (dark blue to bright blue)
-  for i = 1, N do
-    local ratio = (i - 1) / (N - 1)
-    -- Blue gradient: from dark blue #20304f to brighter blue #3050af
-    local r = math.floor(0x20 + ratio * (0x30 - 0x20))
-    local g = math.floor(0x30 + ratio * (0x50 - 0x30))
-    local b = math.floor(0x4f + ratio * (0xaf - 0x4f))
-    local hex = string.format("#%02x%02x%02x", r, g, b)
-    vim.api.nvim_set_hl(0, "GitAnnotateAge" .. i, { bg = hex })
-  end
+	-- 跳转到指定行（同步两个窗口光标）
+	local function jump_to(lnum)
+		lnum = math.max(1, math.min(#annotations, lnum))
+		vim.api.nvim_win_set_cursor(ann_win, { lnum, 0 })
+		vim.api.nvim_win_set_cursor(main_win, { lnum, 0 })
+	end
 
-  -- Apply color highlighting to each line based on commit age
-  local ns = vim.api.nvim_create_namespace("git_annotate")
-  for idx, t in ipairs(times) do
-    if t > 0 then
-      -- Calculate relative age (0 = oldest, 1 = newest)
-      local r = (max_t == min_t) and 1 or (t - min_t) / (max_t - min_t)
-      local bucket = math.floor(r * (N - 1)) + 1
-      vim.api.nvim_buf_add_highlight(buf, ns, "GitAnnotateAge" .. bucket, idx - 1, 0, -1)
-    end
-  end
+	-- ]c / [c：跳转到当前 commit 在文件中的下一个/上一个块边界
+	vim.keymap.set("n", "]c", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local cur_sha = annotations[lnum] and annotations[lnum].sha
+		-- 先跳出当前 commit 块，再找下一个相同 sha 的块起始行
+		local i = lnum + 1
+		while i <= #annotations and annotations[i].sha == cur_sha do
+			i = i + 1
+		end
+		while i <= #annotations and annotations[i].sha ~= cur_sha do
+			i = i + 1
+		end
+		if i <= #annotations then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next hunk of same commit" })
 
-  -- Configure sidebar buffer properties
-  vim.api.nvim_set_option_value("buftype", "nofile", {buf=buf})
-  vim.api.nvim_set_option_value("bufhidden", "wipe", {buf=buf})
-  vim.api.nvim_set_option_value("modifiable", false, {buf=buf})
-  vim.api.nvim_set_option_value("filetype", "gitannotate", {buf=buf})
+	vim.keymap.set("n", "[c", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local cur_sha = annotations[lnum] and annotations[lnum].sha
+		-- 先跳出当前 commit 块，再反向找上一个相同 sha 的块末尾，然后找块起始
+		local i = lnum - 1
+		while i >= 1 and annotations[i].sha == cur_sha do
+			i = i - 1
+		end
+		while i >= 1 and annotations[i].sha ~= cur_sha do
+			i = i - 1
+		end
+		-- 找到该块的起始行
+		while i > 1 and annotations[i - 1].sha == cur_sha do
+			i = i - 1
+		end
+		if i >= 1 and annotations[i].sha == cur_sha then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev hunk of same commit" })
 
-  -- Set fixed sidebar width (prevents resizing with C-w =)
-  vim.api.nvim_win_set_width(win, 30)
-  vim.api.nvim_set_option_value("winfixwidth", true, {win = win})
+	-- ]] / [[：跳转到下一个/上一个不同 commit 块的起始行
+	vim.keymap.set("n", "]]", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local cur_sha = annotations[lnum] and annotations[lnum].sha
+		local i = lnum + 1
+		while i <= #annotations and annotations[i].sha == cur_sha do
+			i = i + 1
+		end
+		if i <= #annotations then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next commit block" })
 
-  -- Setup synchronized scrolling between main and sidebar windows
-  local function sync_annotate()
-    if not (vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_is_valid(win)) then
-      pcall(vim.api.nvim_del_augroup_by_name, "GitAnnotateSync")
-      return
-    end
+	vim.keymap.set("n", "[[", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local cur_sha = annotations[lnum] and annotations[lnum].sha
+		-- 先跳出当前块，再找上一块的起始
+		local i = lnum - 1
+		while i >= 1 and annotations[i].sha == cur_sha do
+			i = i - 1
+		end
+		-- 找到该块的起始行
+		local prev_sha = i >= 1 and annotations[i].sha or nil
+		while i > 1 and annotations[i - 1].sha == prev_sha do
+			i = i - 1
+		end
+		if i >= 1 and prev_sha then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev commit block" })
 
-    -- Get main window's top line
-    local top_line = vim.api.nvim_win_call(main_win, function()
-      return vim.fn.line('w0')
-    end)
+	-- 判断是否为未提交行
+	local function is_uncommitted(sha)
+		return not sha or sha == "" or sha:match("^0+$")
+	end
 
-    -- Sync sidebar's top line to match main window
-    if vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_call(win, function()
-        vim.fn.winrestview({topline = top_line})
-      end)
-    end
-  end
+	-- 在 vsplit 中打开 git show / git diff 内容（参考 gitsigns show_commit）
+	local function open_diff_vsplit(sha)
+		local output, buf_name
+		if is_uncommitted(sha) then
+			output = vim.fn.systemlist({ "git", "diff" })
+			buf_name = "git-annotate://diff (working tree)"
+		else
+			output = vim.fn.systemlist({ "git", "show", "--format=fuller", sha })
+			buf_name = "git-annotate://show/" .. sha:sub(1, 8)
+		end
+		if vim.v.shell_error ~= 0 then
+			vim.notify("Git annotate: " .. table.concat(output, "\n"), vim.log.levels.ERROR)
+			return
+		end
 
-  -- Create autocmd group for scroll synchronization
-  local sync_group = vim.api.nvim_create_augroup("GitAnnotateSync", { clear = true })
-  vim.api.nvim_create_autocmd({ "WinScrolled" }, {
-    group = sync_group,
-    callback = function()
-      if vim.api.nvim_get_current_win() == main_win then
-        sync_annotate()
-      end
-    end,
-  })
+		-- 复用同名 buffer（避免重复打开同一 commit）
+		local commit_buf = nil
+		for _, b in ipairs(vim.api.nvim_list_bufs()) do
+			if vim.api.nvim_buf_get_name(b) == buf_name then
+				commit_buf = b
+				break
+			end
+		end
+		if not commit_buf then
+			commit_buf = vim.api.nvim_create_buf(false, true)
+			vim.api.nvim_buf_set_name(commit_buf, buf_name)
+			vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, output)
+			local cbo = vim.bo[commit_buf]
+			cbo.modifiable = false
+			cbo.buftype = "nofile"
+			cbo.bufhidden = "wipe"
+			cbo.filetype = "git"
+		end
 
-  -- Initial sync after opening
-  sync_annotate()
+		-- 在主窗口右侧打开 vsplit
+		vim.api.nvim_set_current_win(main_win)
+		vim.cmd.vsplit({ mods = { keepalt = true } })
+		vim.api.nvim_win_set_buf(0, commit_buf)
 
-  -- Setup keymaps for closing sidebar
-  vim.api.nvim_buf_set_keymap(buf, 'n', 'q', '<cmd>close<CR>', {noremap=true, silent=true})
-  vim.api.nvim_buf_set_keymap(buf, 'n', '<Esc>', '<cmd>close<CR>', {noremap=true, silent=true})
+		-- q / <Esc> 关闭
+		vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = commit_buf })
+		vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = commit_buf })
+	end
 
-  -- Return focus to main window
-  vim.api.nvim_set_current_win(main_win)
+	-- d: 用 Snacks picker 展示 diff（可搜索/跳转）
+	-- 未提交行打开工作区 diff，已提交行打开 git_log picker
+	vim.keymap.set("n", "d", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		vim.api.nvim_set_current_win(main_win)
+
+		-- picker 公共配置：默认 normal 模式，s 键关闭 picker 并用 vsplit 展示
+		local function picker_opts(sha_for_vsplit)
+			return {
+				on_show = function(picker)
+					-- 打开后立即切换到 normal 模式
+					picker.input:stopinsert()
+					vim.api.nvim_input("<Esc>")
+				end,
+				win = {
+					input = {
+						keys = {
+							["s"] = {
+								function(picker)
+									picker:close()
+									open_diff_vsplit(sha_for_vsplit)
+								end,
+								mode = "n",
+								desc = "Open diff in vsplit",
+							},
+						},
+					},
+				},
+			}
+		end
+
+		if is_uncommitted(sha) then
+			Snacks.picker.git_diff(picker_opts(sha))
+		else
+			Snacks.picker.git_log(vim.tbl_deep_extend("force", picker_opts(sha), {
+				cmd_args = { sha, "-n", "1" },
+				title = "Commit " .. sha:sub(1, 8),
+			}))
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
+
+	-- s: 在 vsplit 中直接展示 git show 内容
+	vim.keymap.set("n", "s", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		open_diff_vsplit(sha)
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (vsplit)" })
+
+	local group = vim.api.nvim_create_augroup("GitAnnotateSync", { clear = true })
+
+	-- 主 buffer 关闭时同步关闭侧边栏
+	vim.api.nvim_create_autocmd({ "BufHidden", "QuitPre" }, {
+		buffer = bufnr,
+		group = group,
+		once = true,
+		callback = function()
+			if vim.api.nvim_win_is_valid(ann_win) then
+				vim.api.nvim_win_close(ann_win, true)
+			end
+		end,
+	})
+
+	-- 侧边栏关闭时恢复主窗口选项
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(ann_win),
+		group = group,
+		callback = function()
+			if vim.api.nvim_win_is_valid(main_win) then
+				main_wlo.scrollbind = orig_scrollbind
+				main_wlo.wrap = orig_wrap
+			end
+		end,
+	})
+
+	-- 焦点回到主窗口
+	vim.api.nvim_set_current_win(main_win)
 end
 
 return M
