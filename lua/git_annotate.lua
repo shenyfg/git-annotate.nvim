@@ -39,11 +39,34 @@ local function parse_blame(blame_output)
 		if line:match("^filename ") then
 			local author = current.author or "Unknown"
 			local author_time = current.author_time or 0
-			local date = os.date("%y/%m/%d", author_time)
+			local text
+			if author == "Not Committed Yet" then
+				text = "Not Committed"
+			else
+				local today = os.date("*t")
+				local commit = os.date("*t", author_time)
+				local date
+				if commit.year == today.year and commit.month == today.month and commit.day == today.day then
+					date = "Today    "
+				else
+					local yesterday = os.date("*t", os.time() - 86400)
+					if
+						commit.year == yesterday.year
+						and commit.month == yesterday.month
+						and commit.day == yesterday.day
+					then
+						date = "Yesterday"
+					else
+						date = os.date("%y/%m/%d ", author_time)
+					end
+				end
+				text = string.format("%s %s", date, author)
+			end
 			table.insert(annotations, {
-				text = string.format("%s %s", date, author),
+				text = text,
 				author_time = author_time,
 				sha = current.sha or "",
+				uncommitted = (author == "Not Committed Yet"),
 			})
 			current = {}
 		end
@@ -92,20 +115,32 @@ local function apply_highlights(annotations, buf)
 			fg = string.format("#%02x%02x%02x", fg_r, fg_g, fg_b),
 		})
 	end
+	-- 未提交行：继承 DiffAdd 配色，加斜体
+	local diffadd = vim.api.nvim_get_hl(0, { name = "DiffAdd", link = false })
+	vim.api.nvim_set_hl(0, "GitAnnotateUncommitted", {
+		default = true,
+		bg = diffadd.bg,
+		fg = diffadd.fg,
+		italic = true,
+	})
 
 	local ns = vim.api.nvim_create_namespace("git_annotate")
 	for idx, ann in ipairs(annotations) do
-		local t = ann.author_time
-		if t > 0 then
+		local hl_group
+		if ann.uncommitted then
+			hl_group = "GitAnnotateUncommitted"
+		else
+			local t = ann.author_time
 			local ratio = (max_t == min_t) and 1 or (t - min_t) / (max_t - min_t)
 			local bucket = math.min(N, math.floor(ratio * (N - 1)) + 1)
-			vim.api.nvim_buf_set_extmark(buf, ns, idx - 1, 0, {
-				end_row = idx,
-				end_col = 0,
-				hl_group = "GitAnnotateAge" .. bucket,
-				hl_eol = true,
-			})
+			hl_group = "GitAnnotateAge" .. bucket
 		end
+		vim.api.nvim_buf_set_extmark(buf, ns, idx - 1, 0, {
+			end_row = idx,
+			end_col = 0,
+			hl_group = hl_group,
+			hl_eol = true,
+		})
 	end
 end
 
@@ -157,7 +192,7 @@ function M.annotate()
 	end, annotations)
 	vim.api.nvim_buf_set_lines(ann_buf, 0, -1, false, lines)
 
-	-- 自动宽度：取最长行宽 + 1
+	-- 自动宽度：取最长行宽，+1 留右边距
 	local max_width = 0
 	for _, l in ipairs(lines) do
 		max_width = math.max(max_width, vim.fn.strdisplaywidth(l))
@@ -183,6 +218,7 @@ function M.annotate()
 	wlo.wrap = false
 	wlo.list = false
 	wlo.spell = false
+	wlo.statuscolumn = ""
 	wlo.winfixwidth = true
 	wlo.scrollbind = true -- 用 scrollbind 同步滚动，比手动 WinScrolled 更可靠
 
@@ -204,7 +240,7 @@ function M.annotate()
 
 	-- 关闭快捷键
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
-	vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
+	-- vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
 
 	-- 跳转到指定行（同步两个窗口光标）
 	local function jump_to(lnum)
