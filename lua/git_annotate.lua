@@ -360,10 +360,6 @@ function M.annotate()
 		vim.api.nvim_set_current_win(main_win)
 		vim.cmd.vsplit({ mods = { keepalt = true } })
 		vim.api.nvim_win_set_buf(0, commit_buf)
-
-		-- q / <Esc> 关闭
-		vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = commit_buf })
-		vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = commit_buf })
 	end
 
 	-- d: 用 Snacks picker 展示 diff（可搜索/跳转）
@@ -407,6 +403,76 @@ function M.annotate()
 			}))
 		end
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
+
+	-- K: 在 float 窗口中展示简要 commit 信息
+	vim.keymap.set("n", "K", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		local lines
+		if is_uncommitted(sha) then
+			lines = { "Not committed yet" }
+		else
+			lines = vim.fn.systemlist({
+				"git",
+				"show",
+				"--no-patch",
+				"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
+				"--date=format:%Y-%m-%d %H:%M",
+				sha,
+			})
+			if vim.v.shell_error ~= 0 then
+				vim.notify("Git annotate: " .. table.concat(lines, "\n"), vim.log.levels.ERROR)
+				return
+			end
+			-- 去掉末尾空行
+			while #lines > 0 and lines[#lines] == "" do
+				table.remove(lines)
+			end
+		end
+
+		local width = 0
+		for _, l in ipairs(lines) do
+			width = math.max(width, vim.fn.strdisplaywidth(l))
+		end
+		width = math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7))
+
+		local float_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
+		vim.bo[float_buf].filetype = "git"
+		vim.bo[float_buf].modifiable = false
+
+		local win_row = vim.api.nvim_win_get_position(ann_win)[1]
+		local cursor_row = vim.api.nvim_win_get_cursor(ann_win)[1] - vim.fn.line("w0", ann_win)
+		-- 优先在光标下方显示，若空间不足则在上方
+		local screen_row = win_row + cursor_row
+		local below_space = vim.o.lines - screen_row - 3
+		local height = math.min(#lines, math.max(3, below_space))
+		local row = (below_space >= #lines) and (cursor_row + 1) or (cursor_row - #lines - 1)
+
+		local float_win = vim.api.nvim_open_win(float_buf, false, {
+			relative = "win",
+			win = ann_win,
+			row = row,
+			col = 0,
+			width = width,
+			height = height,
+			style = "minimal",
+			border = "rounded",
+			zindex = 50,
+		})
+		vim.wo[float_win].wrap = false
+
+		-- 任意移动光标后自动关闭
+		vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave" }, {
+			buffer = ann_buf,
+			once = true,
+			callback = function()
+				if vim.api.nvim_win_is_valid(float_win) then
+					vim.api.nvim_win_close(float_win, true)
+				end
+			end,
+		})
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
 
 	-- s: 在 vsplit 中直接展示 git show 内容
 	vim.keymap.set("n", "s", function()
