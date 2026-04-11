@@ -144,6 +144,257 @@ local function apply_highlights(annotations, buf)
 	end
 end
 
+--- 判断是否为未提交行
+--- @param sha string
+--- @return boolean
+local function is_uncommitted(sha)
+	return not sha or sha == "" or sha:match("^0+$")
+end
+
+--- 在 vsplit 中打开 git show / git diff 内容
+--- @param sha string
+--- @param main_win integer
+local function open_diff_vsplit(sha, main_win)
+	local output, buf_name
+	if is_uncommitted(sha) then
+		output = vim.fn.systemlist({ "git", "diff" })
+		buf_name = "git-annotate://diff (working tree)"
+	else
+		output = vim.fn.systemlist({ "git", "show", "--format=fuller", sha })
+		buf_name = "git-annotate://show/" .. sha:sub(1, 8)
+	end
+	if vim.v.shell_error ~= 0 then
+		vim.notify("Git annotate: " .. table.concat(output, "\n"), vim.log.levels.ERROR)
+		return
+	end
+
+	-- 复用同名 buffer（避免重复打开同一 commit）
+	local commit_buf = nil
+	for _, b in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_get_name(b) == buf_name then
+			commit_buf = b
+			break
+		end
+	end
+	if not commit_buf then
+		commit_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_buf_set_name(commit_buf, buf_name)
+		vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, output)
+		local cbo = vim.bo[commit_buf]
+		cbo.modifiable = false
+		cbo.buftype = "nofile"
+		cbo.bufhidden = "wipe"
+		cbo.filetype = "git"
+	end
+
+	-- 在主窗口右侧打开 vsplit
+	vim.api.nvim_set_current_win(main_win)
+	vim.cmd.vsplit({ mods = { keepalt = true } })
+	vim.api.nvim_win_set_buf(0, commit_buf)
+end
+
+--- 在浮动窗口中展示简要 commit 信息
+--- @param sha string
+--- @param ann_win integer
+--- @param ann_buf integer
+local function show_commit_float(sha, ann_win, ann_buf)
+	local lines
+	if is_uncommitted(sha) then
+		lines = { "Not committed yet" }
+	else
+		lines = vim.fn.systemlist({
+			"git",
+			"show",
+			"--no-patch",
+			"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
+			"--date=format:%Y-%m-%d %H:%M",
+			sha,
+		})
+		if vim.v.shell_error ~= 0 then
+			vim.notify("Git annotate: " .. table.concat(lines, "\n"), vim.log.levels.ERROR)
+			return
+		end
+		-- 去掉末尾空行
+		while #lines > 0 and lines[#lines] == "" do
+			table.remove(lines)
+		end
+	end
+
+	local width = 0
+	for _, l in ipairs(lines) do
+		width = math.max(width, vim.fn.strdisplaywidth(l))
+	end
+	width = math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7))
+
+	local float_buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
+	vim.bo[float_buf].filetype = "git"
+	vim.bo[float_buf].modifiable = false
+
+	local cursor_row = vim.api.nvim_win_get_cursor(ann_win)[1] - vim.fn.line("w0", ann_win)
+	local win_row = vim.api.nvim_win_get_position(ann_win)[1]
+	local below_space = vim.o.lines - (win_row + cursor_row) - 3
+	local height = math.min(#lines, math.max(3, below_space))
+	local row = (below_space >= #lines) and (cursor_row + 1) or (cursor_row - #lines - 1)
+
+	local float_win = vim.api.nvim_open_win(float_buf, false, {
+		relative = "win",
+		win = ann_win,
+		row = row,
+		col = 0,
+		width = width,
+		height = height,
+		style = "minimal",
+		border = "rounded",
+		zindex = 50,
+	})
+	vim.wo[float_win].wrap = false
+
+	-- 任意移动光标后自动关闭
+	vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave" }, {
+		buffer = ann_buf,
+		once = true,
+		callback = function()
+			if vim.api.nvim_win_is_valid(float_win) then
+				vim.api.nvim_win_close(float_win, true)
+			end
+		end,
+	})
+end
+
+--- 绑定侧边栏所有快捷键
+--- @param ann_buf integer
+--- @param ann_win integer
+--- @param main_win integer
+--- @param annotations table
+local function setup_keymaps(ann_buf, ann_win, main_win, annotations)
+	-- 同步跳转两个窗口光标
+	local function jump_to(lnum)
+		lnum = math.max(1, math.min(#annotations, lnum))
+		vim.api.nvim_win_set_cursor(ann_win, { lnum, 0 })
+		vim.api.nvim_win_set_cursor(main_win, { lnum, 0 })
+	end
+
+	local function cur_sha()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		return annotations[lnum] and annotations[lnum].sha
+	end
+
+	-- q: 关闭侧边栏
+	vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
+
+	-- ]c / [c：跳转到当前 commit 在文件中的下一个/上一个块边界
+	vim.keymap.set("n", "]c", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		local i = lnum + 1
+		while i <= #annotations and annotations[i].sha == sha do
+			i = i + 1
+		end
+		while i <= #annotations and annotations[i].sha ~= sha do
+			i = i + 1
+		end
+		if i <= #annotations then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next hunk of same commit" })
+
+	vim.keymap.set("n", "[c", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		local i = lnum - 1
+		while i >= 1 and annotations[i].sha == sha do
+			i = i - 1
+		end
+		while i >= 1 and annotations[i].sha ~= sha do
+			i = i - 1
+		end
+		while i > 1 and annotations[i - 1].sha == sha do
+			i = i - 1
+		end
+		if i >= 1 and annotations[i].sha == sha then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev hunk of same commit" })
+
+	-- ]] / [[：跳转到下一个/上一个不同 commit 块的起始行
+	vim.keymap.set("n", "]]", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		local i = lnum + 1
+		while i <= #annotations and annotations[i].sha == sha do
+			i = i + 1
+		end
+		if i <= #annotations then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next commit block" })
+
+	vim.keymap.set("n", "[[", function()
+		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
+		local sha = annotations[lnum] and annotations[lnum].sha
+		local i = lnum - 1
+		while i >= 1 and annotations[i].sha == sha do
+			i = i - 1
+		end
+		local prev_sha = i >= 1 and annotations[i].sha or nil
+		while i > 1 and annotations[i - 1].sha == prev_sha do
+			i = i - 1
+		end
+		if i >= 1 and prev_sha then
+			jump_to(i)
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev commit block" })
+
+	-- K: 浮动窗口展示简要 commit 信息
+	vim.keymap.set("n", "K", function()
+		show_commit_float(cur_sha(), ann_win, ann_buf)
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
+
+	-- s: 在 vsplit 中直接展示 git show 内容
+	vim.keymap.set("n", "s", function()
+		open_diff_vsplit(cur_sha(), main_win)
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (vsplit)" })
+
+	-- d: 用 Snacks picker 展示 diff（可搜索/跳转）
+	vim.keymap.set("n", "d", function()
+		local sha = cur_sha()
+		vim.api.nvim_set_current_win(main_win)
+
+		local function picker_opts(sha_for_vsplit)
+			return {
+				on_show = function(picker)
+					picker.input:stopinsert()
+					vim.api.nvim_input("<Esc>")
+				end,
+				win = {
+					input = {
+						keys = {
+							["s"] = {
+								function(picker)
+									picker:close()
+									open_diff_vsplit(sha_for_vsplit, main_win)
+								end,
+								mode = "n",
+								desc = "Open diff in vsplit",
+							},
+						},
+					},
+				},
+			}
+		end
+
+		if is_uncommitted(sha) then
+			Snacks.picker.git_diff(picker_opts(sha))
+		else
+			Snacks.picker.git_log(vim.tbl_deep_extend("force", picker_opts(sha), {
+				cmd_args = { sha, "-n", "1" },
+				title = "Commit " .. sha:sub(1, 8),
+			}))
+		end
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
+end
+
 --- 打开/关闭 Git annotate 侧边栏
 function M.annotate()
 	-- 关闭已有的 annotate 侧边栏（toggle）
@@ -220,7 +471,7 @@ function M.annotate()
 	wlo.spell = false
 	wlo.statuscolumn = ""
 	wlo.winfixwidth = true
-	wlo.scrollbind = true -- 用 scrollbind 同步滚动，比手动 WinScrolled 更可靠
+	wlo.scrollbind = true
 
 	-- 对齐滚动位置
 	vim.cmd(tostring(top))
@@ -238,248 +489,7 @@ function M.annotate()
 	vim.cmd.redraw()
 	vim.cmd.syncbind()
 
-	-- 关闭快捷键
-	vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
-	-- vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
-
-	-- 跳转到指定行（同步两个窗口光标）
-	local function jump_to(lnum)
-		lnum = math.max(1, math.min(#annotations, lnum))
-		vim.api.nvim_win_set_cursor(ann_win, { lnum, 0 })
-		vim.api.nvim_win_set_cursor(main_win, { lnum, 0 })
-	end
-
-	-- ]c / [c：跳转到当前 commit 在文件中的下一个/上一个块边界
-	vim.keymap.set("n", "]c", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local cur_sha = annotations[lnum] and annotations[lnum].sha
-		-- 先跳出当前 commit 块，再找下一个相同 sha 的块起始行
-		local i = lnum + 1
-		while i <= #annotations and annotations[i].sha == cur_sha do
-			i = i + 1
-		end
-		while i <= #annotations and annotations[i].sha ~= cur_sha do
-			i = i + 1
-		end
-		if i <= #annotations then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next hunk of same commit" })
-
-	vim.keymap.set("n", "[c", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local cur_sha = annotations[lnum] and annotations[lnum].sha
-		-- 先跳出当前 commit 块，再反向找上一个相同 sha 的块末尾，然后找块起始
-		local i = lnum - 1
-		while i >= 1 and annotations[i].sha == cur_sha do
-			i = i - 1
-		end
-		while i >= 1 and annotations[i].sha ~= cur_sha do
-			i = i - 1
-		end
-		-- 找到该块的起始行
-		while i > 1 and annotations[i - 1].sha == cur_sha do
-			i = i - 1
-		end
-		if i >= 1 and annotations[i].sha == cur_sha then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev hunk of same commit" })
-
-	-- ]] / [[：跳转到下一个/上一个不同 commit 块的起始行
-	vim.keymap.set("n", "]]", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local cur_sha = annotations[lnum] and annotations[lnum].sha
-		local i = lnum + 1
-		while i <= #annotations and annotations[i].sha == cur_sha do
-			i = i + 1
-		end
-		if i <= #annotations then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next commit block" })
-
-	vim.keymap.set("n", "[[", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local cur_sha = annotations[lnum] and annotations[lnum].sha
-		-- 先跳出当前块，再找上一块的起始
-		local i = lnum - 1
-		while i >= 1 and annotations[i].sha == cur_sha do
-			i = i - 1
-		end
-		-- 找到该块的起始行
-		local prev_sha = i >= 1 and annotations[i].sha or nil
-		while i > 1 and annotations[i - 1].sha == prev_sha do
-			i = i - 1
-		end
-		if i >= 1 and prev_sha then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev commit block" })
-
-	-- 判断是否为未提交行
-	local function is_uncommitted(sha)
-		return not sha or sha == "" or sha:match("^0+$")
-	end
-
-	-- 在 vsplit 中打开 git show / git diff 内容（参考 gitsigns show_commit）
-	local function open_diff_vsplit(sha)
-		local output, buf_name
-		if is_uncommitted(sha) then
-			output = vim.fn.systemlist({ "git", "diff" })
-			buf_name = "git-annotate://diff (working tree)"
-		else
-			output = vim.fn.systemlist({ "git", "show", "--format=fuller", sha })
-			buf_name = "git-annotate://show/" .. sha:sub(1, 8)
-		end
-		if vim.v.shell_error ~= 0 then
-			vim.notify("Git annotate: " .. table.concat(output, "\n"), vim.log.levels.ERROR)
-			return
-		end
-
-		-- 复用同名 buffer（避免重复打开同一 commit）
-		local commit_buf = nil
-		for _, b in ipairs(vim.api.nvim_list_bufs()) do
-			if vim.api.nvim_buf_get_name(b) == buf_name then
-				commit_buf = b
-				break
-			end
-		end
-		if not commit_buf then
-			commit_buf = vim.api.nvim_create_buf(false, true)
-			vim.api.nvim_buf_set_name(commit_buf, buf_name)
-			vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, output)
-			local cbo = vim.bo[commit_buf]
-			cbo.modifiable = false
-			cbo.buftype = "nofile"
-			cbo.bufhidden = "wipe"
-			cbo.filetype = "git"
-		end
-
-		-- 在主窗口右侧打开 vsplit
-		vim.api.nvim_set_current_win(main_win)
-		vim.cmd.vsplit({ mods = { keepalt = true } })
-		vim.api.nvim_win_set_buf(0, commit_buf)
-	end
-
-	-- d: 用 Snacks picker 展示 diff（可搜索/跳转）
-	-- 未提交行打开工作区 diff，已提交行打开 git_log picker
-	vim.keymap.set("n", "d", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local sha = annotations[lnum] and annotations[lnum].sha
-		vim.api.nvim_set_current_win(main_win)
-
-		-- picker 公共配置：默认 normal 模式，s 键关闭 picker 并用 vsplit 展示
-		local function picker_opts(sha_for_vsplit)
-			return {
-				on_show = function(picker)
-					-- 打开后立即切换到 normal 模式
-					picker.input:stopinsert()
-					vim.api.nvim_input("<Esc>")
-				end,
-				win = {
-					input = {
-						keys = {
-							["s"] = {
-								function(picker)
-									picker:close()
-									open_diff_vsplit(sha_for_vsplit)
-								end,
-								mode = "n",
-								desc = "Open diff in vsplit",
-							},
-						},
-					},
-				},
-			}
-		end
-
-		if is_uncommitted(sha) then
-			Snacks.picker.git_diff(picker_opts(sha))
-		else
-			Snacks.picker.git_log(vim.tbl_deep_extend("force", picker_opts(sha), {
-				cmd_args = { sha, "-n", "1" },
-				title = "Commit " .. sha:sub(1, 8),
-			}))
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
-
-	-- K: 在 float 窗口中展示简要 commit 信息
-	vim.keymap.set("n", "K", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local sha = annotations[lnum] and annotations[lnum].sha
-		local lines
-		if is_uncommitted(sha) then
-			lines = { "Not committed yet" }
-		else
-			lines = vim.fn.systemlist({
-				"git",
-				"show",
-				"--no-patch",
-				"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
-				"--date=format:%Y-%m-%d %H:%M",
-				sha,
-			})
-			if vim.v.shell_error ~= 0 then
-				vim.notify("Git annotate: " .. table.concat(lines, "\n"), vim.log.levels.ERROR)
-				return
-			end
-			-- 去掉末尾空行
-			while #lines > 0 and lines[#lines] == "" do
-				table.remove(lines)
-			end
-		end
-
-		local width = 0
-		for _, l in ipairs(lines) do
-			width = math.max(width, vim.fn.strdisplaywidth(l))
-		end
-		width = math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7))
-
-		local float_buf = vim.api.nvim_create_buf(false, true)
-		vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
-		vim.bo[float_buf].filetype = "git"
-		vim.bo[float_buf].modifiable = false
-
-		local win_row = vim.api.nvim_win_get_position(ann_win)[1]
-		local cursor_row = vim.api.nvim_win_get_cursor(ann_win)[1] - vim.fn.line("w0", ann_win)
-		-- 优先在光标下方显示，若空间不足则在上方
-		local screen_row = win_row + cursor_row
-		local below_space = vim.o.lines - screen_row - 3
-		local height = math.min(#lines, math.max(3, below_space))
-		local row = (below_space >= #lines) and (cursor_row + 1) or (cursor_row - #lines - 1)
-
-		local float_win = vim.api.nvim_open_win(float_buf, false, {
-			relative = "win",
-			win = ann_win,
-			row = row,
-			col = 0,
-			width = width,
-			height = height,
-			style = "minimal",
-			border = "rounded",
-			zindex = 50,
-		})
-		vim.wo[float_win].wrap = false
-
-		-- 任意移动光标后自动关闭
-		vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave" }, {
-			buffer = ann_buf,
-			once = true,
-			callback = function()
-				if vim.api.nvim_win_is_valid(float_win) then
-					vim.api.nvim_win_close(float_win, true)
-				end
-			end,
-		})
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
-
-	-- s: 在 vsplit 中直接展示 git show 内容
-	vim.keymap.set("n", "s", function()
-		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local sha = annotations[lnum] and annotations[lnum].sha
-		open_diff_vsplit(sha)
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (vsplit)" })
+	setup_keymaps(ann_buf, ann_win, main_win, annotations)
 
 	local group = vim.api.nvim_create_augroup("GitAnnotateSync", { clear = true })
 
