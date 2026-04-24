@@ -395,41 +395,13 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
 end
 
---- 打开/关闭 Git annotate 侧边栏
-function M.annotate()
-	-- 关闭已有的 annotate 侧边栏（toggle）
-	for _, w in ipairs(vim.api.nvim_list_wins()) do
-		local b = vim.api.nvim_win_get_buf(w)
-		if vim.api.nvim_get_option_value("filetype", { buf = b }) == "gitannotate" then
-			vim.api.nvim_win_close(w, true)
-			return
-		end
-	end
-
-	local bufnr = vim.api.nvim_get_current_buf()
-	local filename = vim.api.nvim_buf_get_name(bufnr)
-	if filename == "" then
-		vim.notify("Git annotate: No file associated with current buffer", vim.log.levels.WARN)
-		return
-	end
-
-	-- 执行 git blame
-	local blame_output = vim.fn.systemlist({ "git", "blame", "--line-porcelain", filename })
-	if vim.v.shell_error ~= 0 then
-		vim.notify("Git annotate: git blame failed\n" .. table.concat(blame_output, "\n"), vim.log.levels.ERROR)
-		return
-	end
-
-	local annotations = parse_blame(blame_output)
-	if #annotations == 0 then
-		vim.notify("Git annotate: no blame data", vim.log.levels.WARN)
-		return
-	end
-
-	-- 记录主窗口，用于 scrollbind 对齐
-	local main_win = vim.api.nvim_get_current_win()
-	local top = vim.fn.line("w0") + vim.wo.scrolloff
-	local current_line = vim.fn.line(".")
+--- 创建侧边栏并设置所有交互逻辑（从异步回调中调用）
+--- @param annotations {text: string, author_time: integer, sha: string, uncommitted: boolean}[]
+--- @param bufnr integer 主 buffer
+--- @param main_win integer 主窗口
+--- @param top integer 主窗口顶部行号
+--- @param current_line integer 主窗口光标行号
+function M._open_sidebar(annotations, bufnr, main_win, top, current_line)
 
 	-- 在左侧创建侧边栏
 	vim.cmd.vsplit({ mods = { keepalt = true, split = "aboveleft" } })
@@ -519,6 +491,63 @@ function M.annotate()
 
 	-- 焦点回到主窗口
 	vim.api.nvim_set_current_win(main_win)
+end
+
+--- 打开/关闭 Git annotate 侧边栏
+function M.annotate()
+	-- 关闭已有的 annotate 侧边栏（toggle）
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		local b = vim.api.nvim_win_get_buf(w)
+		if vim.api.nvim_get_option_value("filetype", { buf = b }) == "gitannotate" then
+			vim.api.nvim_win_close(w, true)
+			return
+		end
+	end
+
+	local bufnr = vim.api.nvim_get_current_buf()
+	local filename = vim.api.nvim_buf_get_name(bufnr)
+	if filename == "" then
+		vim.notify("Git annotate: No file associated with current buffer", vim.log.levels.WARN)
+		return
+	end
+
+	-- 记录主窗口状态（异步回调前快照，避免用户切换窗口后状态错乱）
+	local main_win = vim.api.nvim_get_current_win()
+	local top = vim.fn.line("w0") + vim.wo.scrolloff
+	local current_line = vim.fn.line(".")
+
+	vim.notify("Git annotate: loading…", vim.log.levels.INFO)
+
+	-- 异步执行 git blame，避免大文件时阻塞 Neovim 事件循环
+	vim.system(
+		{ "git", "blame", "--line-porcelain", filename },
+		{ text = true },
+		vim.schedule_wrap(function(result)
+			if result.code ~= 0 then
+				vim.notify(
+					"Git annotate: git blame failed\n" .. (result.stderr or ""),
+					vim.log.levels.ERROR
+				)
+				return
+			end
+
+			local blame_output = vim.split(result.stdout, "\n", { plain = true })
+			local annotations = parse_blame(blame_output)
+			if #annotations == 0 then
+				vim.notify("Git annotate: no blame data", vim.log.levels.WARN)
+				return
+			end
+
+			-- 确认主窗口仍有效（异步期间用户可能已关闭）
+			if not vim.api.nvim_win_is_valid(main_win) then
+				vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
+				return
+			end
+			vim.api.nvim_set_current_win(main_win)
+
+			M._open_sidebar(annotations, bufnr, main_win, top, current_line)
+		end)
+	)
 end
 
 return M
