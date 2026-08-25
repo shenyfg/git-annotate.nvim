@@ -21,7 +21,7 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ## Usage
 
-Run `:lua require("git_annotate").annotate()` or use your keymap to toggle the sidebar on the left of the current file.
+Run `:lua require("git_annotate").annotate()` or use your keymap to toggle and automatically focus the sidebar on the left of the current file.
 
 ### Sidebar Keymaps
 
@@ -29,13 +29,18 @@ Run `:lua require("git_annotate").annotate()` or use your keymap to toggle the s
 |---|---|
 | `q` / `<Esc>` | Close the sidebar |
 | `s` | Open `git show` for the commit under cursor in a vsplit |
-| `d` | Show diff in Snacks picker (working tree diff for uncommitted lines) |
-| `]]` | Jump to the start of the next commit block |
-| `[[` | Jump to the start of the previous commit block |
-| `]c` | Jump to the next occurrence of the same commit in the file |
-| `[c` | Jump to the previous occurrence of the same commit in the file |
+| `d` | List changed files in Snacks and preview the selected file diff |
+| `]]` | Jump to the next occurrence of the same commit in the file |
+| `[[` | Jump to the previous occurrence of the same commit in the file |
+| `]c` | Jump to the start of the next commit block |
+| `[c` | Jump to the start of the previous commit block |
 
-> `d` requires [snacks.nvim](https://github.com/folke/snacks.nvim). Use `s` if it's not installed.
+> `d` requires [snacks.nvim](https://github.com/folke/snacks.nvim). The picker starts on the current file when possible; press `s` to open the selected file diff in a vsplit, or `S` to open the complete commit/tracked working tree diff. Untracked files are available through their per-file preview. Use the sidebar `s` key if Snacks isn't installed.
+
+## Large commit protection
+
+- Diff output opened with `s`/`S`, per-file previews opened with `d`, and commit file lists are limited to 2 MiB. Oversized output is truncated and clearly marked.
+- Whole root-commit views show metadata only and omit the complete patch. The `d` picker still lists root-commit files and safely previews only the selected file.
 
 ## Requirements
 
