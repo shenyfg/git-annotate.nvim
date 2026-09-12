@@ -28,6 +28,7 @@ Run `:lua require("git_annotate").annotate()` or use your keymap to toggle and a
 | Key | Description |
 |---|---|
 | `q` / `<Esc>` | Close the sidebar |
+| `K` | Show commit information in a floating window |
 | `s` | Open `git show` for the commit under cursor in a vsplit |
 | `d` | List changed files in Snacks and preview the selected file diff |
 | `]]` | Jump to the next occurrence of the same commit in the file |

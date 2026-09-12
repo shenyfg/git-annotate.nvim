@@ -30,6 +30,7 @@ Annotate your code like PyCharm/IntelliJ — in Neovim.
 | 键 | 说明 |
 |---|---|
 | `q` / `<Esc>` | 关闭侧边栏 |
+| `K` | 在浮动窗口中查看当前行的提交信息 |
 | `s` | 在右侧 vsplit 中查看当前行所在 commit 的 `git show` |
 | `d` | 用 Snacks 列出变更文件，并预览选中文件的 diff |
 | `]]` | 跳到当前 commit 在文件中的下一个块 |

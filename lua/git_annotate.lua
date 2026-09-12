@@ -2,6 +2,8 @@ local M = {}
 
 local MAX_DIFF_PREVIEW_BYTES = 2 * 1024 * 1024
 local preview_ns = vim.api.nvim_create_namespace("git_annotate_preview")
+local pending_request
+local hover_requests = {}
 
 --- 解析 git blame --line-porcelain 输出
 --- 每个 commit 块格式：
@@ -200,6 +202,7 @@ end
 --- @param command string[]
 --- @param callback fun(result: {code: integer, signal: integer, stdout: string, stderr: string, truncated: boolean})
 --- @param cwd? string
+--- @return vim.SystemObj
 local function collect_bounded(command, callback, cwd)
 	local stdout_chunks = {}
 	local stderr_chunks = {}
@@ -258,24 +261,29 @@ local function collect_bounded(command, callback, cwd)
 		stderr_bytes = stderr_bytes + #data
 	end
 
-	process = vim.system(command, {
-		text = true,
-		cwd = cwd,
-		stdout = collect_stdout,
-		stderr = collect_stderr,
-	}, vim.schedule_wrap(function(result)
-		callback({
-			code = result.code,
-			signal = result.signal,
-			stdout = table.concat(stdout_chunks),
-			stderr = table.concat(stderr_chunks),
-			truncated = truncated,
-		})
-	end))
+	process = vim.system(
+		command,
+		{
+			text = true,
+			cwd = cwd,
+			stdout = collect_stdout,
+			stderr = collect_stderr,
+		},
+		vim.schedule_wrap(function(result)
+			callback({
+				code = result.code,
+				signal = result.signal,
+				stdout = table.concat(stdout_chunks),
+				stderr = table.concat(stderr_chunks),
+				truncated = truncated,
+			})
+		end)
+	)
 
 	if kill_pending then
 		pcall(process.kill, process, 15)
 	end
+	return process
 end
 
 --- 解析 diff 命令输出并添加保护提示
@@ -363,18 +371,23 @@ local function open_diff_vsplit(sha, main_win, cwd)
 		vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
 		return
 	end
+	local source_buf = vim.api.nvim_win_get_buf(main_win)
+	local function source_is_valid()
+		return vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_get_buf(main_win) == source_buf
+	end
 
 	resolve_diff_command(sha, function(command, root, err)
+		if not source_is_valid() then
+			return
+		end
 		if not command then
 			vim.notify("Git annotate: " .. (err or "failed to build diff command"), vim.log.levels.ERROR)
 			return
 		end
-		if not vim.api.nvim_win_is_valid(main_win) then
-			vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
-			return
-		end
-
 		collect_bounded(command, function(result)
+			if not source_is_valid() then
+				return
+			end
 			if result.code ~= 0 and not result.truncated then
 				local message = result.stderr ~= "" and result.stderr or "git diff failed"
 				vim.notify("Git annotate: " .. message, vim.log.levels.ERROR)
@@ -392,69 +405,113 @@ end
 --- @param sha string
 --- @param ann_win integer
 --- @param ann_buf integer
-local function show_commit_float(sha, ann_win, ann_buf)
-	local lines
-	if is_uncommitted(sha) then
-		lines = { "Not committed yet" }
-	else
-		lines = vim.fn.systemlist({
-			"git",
-			"show",
-			"--no-patch",
-			"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
-			"--date=format:%Y-%m-%d %H:%M",
-			sha,
-		})
-		if vim.v.shell_error ~= 0 then
-			vim.notify("Git annotate: " .. table.concat(lines, "\n"), vim.log.levels.ERROR)
+--- @param cwd string
+local function show_commit_float(sha, ann_win, ann_buf, cwd)
+	if hover_requests[ann_buf] then
+		hover_requests[ann_buf]()
+	end
+
+	local closed = false
+	local float_win, process
+	local cursor = vim.api.nvim_win_get_cursor(ann_win)
+	local group = vim.api.nvim_create_augroup("GitAnnotateHover" .. ann_buf, { clear = true })
+	local function close()
+		if closed then
 			return
 		end
-		-- 去掉末尾空行
-		while #lines > 0 and lines[#lines] == "" do
-			table.remove(lines)
+		closed = true
+		hover_requests[ann_buf] = nil
+		vim.api.nvim_del_augroup_by_id(group)
+		if process then
+			pcall(process.kill, process, 15)
+		end
+		if float_win and vim.api.nvim_win_is_valid(float_win) then
+			vim.api.nvim_win_close(float_win, true)
 		end
 	end
-
-	local width = 0
-	for _, l in ipairs(lines) do
-		width = math.max(width, vim.fn.strdisplaywidth(l))
-	end
-	width = math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7))
-
-	local float_buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
-	vim.bo[float_buf].filetype = "git"
-	vim.bo[float_buf].modifiable = false
-
-	local cursor_row = vim.api.nvim_win_get_cursor(ann_win)[1] - vim.fn.line("w0", ann_win)
-	local win_row = vim.api.nvim_win_get_position(ann_win)[1]
-	local below_space = vim.o.lines - (win_row + cursor_row) - 3
-	local height = math.min(#lines, math.max(3, below_space))
-	local row = (below_space >= #lines) and (cursor_row + 1) or (cursor_row - #lines - 1)
-
-	local float_win = vim.api.nvim_open_win(float_buf, false, {
-		relative = "win",
-		win = ann_win,
-		row = row,
-		col = 0,
-		width = width,
-		height = height,
-		style = "minimal",
-		border = "rounded",
-		zindex = 50,
-	})
-	vim.wo[float_win].wrap = false
-
-	-- 任意移动光标后自动关闭
-	vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave" }, {
+	hover_requests[ann_buf] = close
+	vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave", "BufWipeout" }, {
 		buffer = ann_buf,
-		once = true,
-		callback = function()
-			if vim.api.nvim_win_is_valid(float_win) then
-				vim.api.nvim_win_close(float_win, true)
-			end
-		end,
+		group = group,
+		callback = close,
 	})
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(ann_win),
+		group = group,
+		callback = close,
+	})
+
+	local function show(lines)
+		if closed then
+			return
+		end
+		if
+			not vim.api.nvim_win_is_valid(ann_win)
+			or vim.api.nvim_get_current_win() ~= ann_win
+			or vim.api.nvim_win_get_buf(ann_win) ~= ann_buf
+			or not vim.deep_equal(vim.api.nvim_win_get_cursor(ann_win), cursor)
+		then
+			close()
+			return
+		end
+		while #lines > 1 and lines[#lines] == "" do
+			table.remove(lines)
+		end
+		local width = 0
+		for _, line in ipairs(lines) do
+			width = math.max(width, vim.fn.strdisplaywidth(line))
+		end
+		width = math.max(1, math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7)))
+		local height = math.max(1, math.min(#lines, vim.o.lines - 4))
+		local float_buf = vim.api.nvim_create_buf(false, true)
+		vim.bo[float_buf].bufhidden = "wipe"
+		vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
+		vim.bo[float_buf].filetype = "git"
+		vim.bo[float_buf].modifiable = false
+		float_win = vim.api.nvim_open_win(float_buf, false, {
+			relative = "cursor",
+			row = 1,
+			col = 0,
+			width = width,
+			height = height,
+			style = "minimal",
+			border = "rounded",
+			zindex = 50,
+		})
+		vim.wo[float_win].wrap = false
+		vim.api.nvim_create_autocmd("WinClosed", {
+			pattern = tostring(float_win),
+			group = group,
+			callback = function()
+				float_win = nil
+				close()
+			end,
+		})
+	end
+
+	if is_uncommitted(sha) then
+		show({ "Not committed yet" })
+		return
+	end
+	process = collect_bounded({
+		"git",
+		"show",
+		"--no-patch",
+		"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
+		"--date=format:%Y-%m-%d %H:%M",
+		sha,
+	}, function(result)
+		process = nil
+		if closed then
+			return
+		end
+		if result.code ~= 0 and not result.truncated then
+			close()
+			vim.notify("Git annotate: " .. result.stderr, vim.log.levels.ERROR)
+			return
+		end
+		show(diff_lines(result.stdout, false, result.truncated))
+	end, cwd)
 end
 
 --- 使用 Snacks 与 git status 相同的 diff 风格渲染已收集的内容
@@ -533,8 +590,7 @@ local function preview_file_change(ctx, state)
 		return
 	end
 
-	local title = (state.working and "Working Tree · " or "Commit " .. state.sha:sub(1, 8) .. " · ")
-		.. ctx.item.file
+	local title = (state.working and "Working Tree · " or "Commit " .. state.sha:sub(1, 8) .. " · ") .. ctx.item.file
 	ctx.preview:reset()
 	ctx.preview:set_title(title)
 	ctx.preview:set_lines({ "Loading diff…" })
@@ -572,11 +628,15 @@ end
 --- @param item table
 --- @param main_win integer
 local function open_file_diff_vsplit(state, item, main_win)
-	if not item or not item.file then
+	if not item or not item.file or not vim.api.nvim_win_is_valid(main_win) then
 		return
 	end
+	local source_buf = vim.api.nvim_win_get_buf(main_win)
 	local command, allow_exit_one = file_diff_command(state, item)
 	collect_bounded(command, function(result)
+		if not vim.api.nvim_win_is_valid(main_win) or vim.api.nvim_win_get_buf(main_win) ~= source_buf then
+			return
+		end
 		if not diff_succeeded(result, allow_exit_one) then
 			local message = result.stderr ~= "" and result.stderr or "git diff failed"
 			vim.notify("Git annotate: " .. message, vim.log.levels.ERROR)
@@ -776,26 +836,34 @@ end
 --- @param sha string
 --- @param ann_win integer
 --- @param main_win integer
-local function open_change_picker(sha, ann_win, main_win)
+--- @param cwd string
+local function open_change_picker(sha, ann_win, main_win, cwd)
 	if not vim.api.nvim_win_is_valid(ann_win) or not vim.api.nvim_win_is_valid(main_win) then
 		vim.notify("Git annotate: annotate or source window closed", vim.log.levels.WARN)
 		return
 	end
 
-	local source_file = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(main_win))
-	local start_dir = vim.fn.fnamemodify(source_file, ":h")
-	local cwd = Snacks.git.get_root(start_dir) or vim.fn.getcwd()
+	local ok, snacks = pcall(require, "snacks")
+	if not ok or not snacks.picker then
+		vim.notify("Git annotate: d requires snacks.nvim; use s to open the diff", vim.log.levels.WARN)
+		return
+	end
+	local source_buf = vim.api.nvim_win_get_buf(main_win)
+	local source_file = vim.api.nvim_buf_get_name(source_buf)
 	local working = is_uncommitted(sha)
 	local state = { working = working, sha = working and nil or sha, cwd = cwd }
 
 	if working then
 		vim.api.nvim_set_current_win(main_win)
-		Snacks.picker.git_status(change_picker_opts(state, ann_win, main_win, source_file))
+		snacks.picker.git_status(change_picker_opts(state, ann_win, main_win, source_file))
 		return
 	end
 
 	load_commit_files(sha, cwd, function(items, root, err, truncated)
 		if not vim.api.nvim_win_is_valid(ann_win) or not vim.api.nvim_win_is_valid(main_win) then
+			return
+		end
+		if vim.api.nvim_win_get_buf(main_win) ~= source_buf then
 			return
 		end
 		if not items then
@@ -814,7 +882,7 @@ local function open_change_picker(sha, ann_win, main_win)
 		vim.api.nvim_set_current_win(main_win)
 		local opts = change_picker_opts(state, ann_win, main_win, source_file)
 		opts.items = items
-		Snacks.picker.pick(opts)
+		snacks.picker.pick(opts)
 	end)
 end
 
@@ -823,7 +891,8 @@ end
 --- @param ann_win integer
 --- @param main_win integer
 --- @param annotations table
-local function setup_keymaps(ann_buf, ann_win, main_win, annotations)
+--- @param cwd string
+local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 	-- 同步跳转两个窗口光标
 	local function jump_to(lnum)
 		lnum = math.max(1, math.min(#annotations, lnum))
@@ -838,6 +907,7 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations)
 
 	-- q: 关闭侧边栏
 	vim.keymap.set("n", "q", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
+	vim.keymap.set("n", "<Esc>", "<cmd>close<CR>", { noremap = true, silent = true, buffer = ann_buf })
 
 	-- ]] / [[：跳转到当前 commit 在文件中的下一个/上一个块边界
 	vim.keymap.set("n", "]]", function()
@@ -904,17 +974,17 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations)
 
 	-- K: 浮动窗口展示简要 commit 信息
 	vim.keymap.set("n", "K", function()
-		show_commit_float(cur_sha(), ann_win, ann_buf)
+		show_commit_float(cur_sha(), ann_win, ann_buf, cwd)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
 
 	-- s: 在 vsplit 中直接展示 git show 内容
 	vim.keymap.set("n", "s", function()
-		open_diff_vsplit(cur_sha(), main_win)
+		open_diff_vsplit(cur_sha(), main_win, cwd)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (vsplit)" })
 
 	-- d: 用 Snacks picker 展示变更文件列表与 diff
 	vim.keymap.set("n", "d", function()
-		open_change_picker(cur_sha(), ann_win, main_win)
+		open_change_picker(cur_sha(), ann_win, main_win, cwd)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (picker)" })
 end
 
@@ -924,8 +994,8 @@ end
 --- @param main_win integer 主窗口
 --- @param top integer 主窗口顶部行号
 --- @param current_line integer 主窗口光标行号
-function M._open_sidebar(annotations, bufnr, main_win, top, current_line)
-
+--- @param cwd string 仓库根目录
+function M._open_sidebar(annotations, bufnr, main_win, top, current_line, cwd)
 	-- 在左侧创建侧边栏
 	vim.cmd.vsplit({ mods = { keepalt = true, split = "aboveleft" } })
 	local ann_win = vim.api.nvim_get_current_win()
@@ -956,6 +1026,22 @@ function M._open_sidebar(annotations, bufnr, main_win, top, current_line)
 
 	-- 窗口属性
 	local wlo = vim.wo[ann_win][0]
+	local original_options = {}
+	for _, name in ipairs({
+		"number",
+		"relativenumber",
+		"signcolumn",
+		"foldcolumn",
+		"foldenable",
+		"wrap",
+		"list",
+		"spell",
+		"statuscolumn",
+		"winfixwidth",
+		"scrollbind",
+	}) do
+		original_options[name] = wlo[name]
+	end
 	wlo.number = false
 	wlo.relativenumber = false
 	wlo.signcolumn = "no"
@@ -978,38 +1064,75 @@ function M._open_sidebar(annotations, bufnr, main_win, top, current_line)
 	local main_wlo = vim.wo[main_win][0]
 	local orig_scrollbind = main_wlo.scrollbind
 	local orig_wrap = main_wlo.wrap
+	local orig_foldenable = main_wlo.foldenable
 	main_wlo.scrollbind = true
 	main_wlo.wrap = false
+	main_wlo.foldenable = false
 
 	vim.cmd.redraw()
 	vim.cmd.syncbind()
 
-	setup_keymaps(ann_buf, ann_win, main_win, annotations)
+	setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 
-	local group = vim.api.nvim_create_augroup("GitAnnotateSync", { clear = true })
-
-	-- 主 buffer 关闭时同步关闭侧边栏
-	vim.api.nvim_create_autocmd({ "BufHidden", "QuitPre" }, {
-		buffer = bufnr,
-		group = group,
-		once = true,
-		callback = function()
-			if vim.api.nvim_win_is_valid(ann_win) then
+	local group = vim.api.nvim_create_augroup("GitAnnotateSync" .. ann_win, { clear = true })
+	local cleaned = false
+	local function cleanup()
+		if cleaned then
+			return
+		end
+		cleaned = true
+		vim.api.nvim_del_augroup_by_id(group)
+		if hover_requests[ann_buf] then
+			hover_requests[ann_buf]()
+		end
+		if vim.api.nvim_win_is_valid(main_win) then
+			main_wlo.scrollbind = orig_scrollbind
+			main_wlo.wrap = orig_wrap
+			main_wlo.foldenable = orig_foldenable
+		end
+	end
+	local function close_sidebar()
+		cleanup()
+		if vim.api.nvim_win_is_valid(ann_win) then
+			local normal_windows = 0
+			for _, win in ipairs(vim.api.nvim_list_wins()) do
+				if vim.api.nvim_win_get_config(win).relative == "" then
+					normal_windows = normal_windows + 1
+				end
+			end
+			if normal_windows == 1 then
+				-- Neovim must retain one normal window after the source closes.
+				vim.api.nvim_win_set_buf(ann_win, vim.api.nvim_create_buf(true, false))
+				for name, value in pairs(original_options) do
+					wlo[name] = value
+				end
+			else
 				vim.api.nvim_win_close(ann_win, true)
+			end
+		end
+	end
+
+	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+		group = group,
+		callback = function()
+			if vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_get_buf(main_win) ~= bufnr then
+				close_sidebar()
 			end
 		end,
 	})
-
-	-- 侧边栏关闭时恢复主窗口选项
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(main_win),
+		group = group,
+		callback = function()
+			cleanup()
+			-- Wait until the source has actually been removed before counting windows.
+			vim.schedule(close_sidebar)
+		end,
+	})
 	vim.api.nvim_create_autocmd("WinClosed", {
 		pattern = tostring(ann_win),
 		group = group,
-		callback = function()
-			if vim.api.nvim_win_is_valid(main_win) then
-				main_wlo.scrollbind = orig_scrollbind
-				main_wlo.wrap = orig_wrap
-			end
-		end,
+		callback = cleanup,
 	})
 
 	-- 打开后默认聚焦侧边栏，便于直接使用 annotate 快捷键
@@ -1018,10 +1141,18 @@ end
 
 --- 打开/关闭 Git annotate 侧边栏
 function M.annotate()
-	-- 关闭已有的 annotate 侧边栏（toggle）
+	-- A second toggle cancels loading, including callbacks already queued.
+	if pending_request then
+		local request = pending_request
+		pending_request = nil
+		if request.process then
+			pcall(request.process.kill, request.process, 15)
+		end
+		return
+	end
 	for _, w in ipairs(vim.api.nvim_list_wins()) do
 		local b = vim.api.nvim_win_get_buf(w)
-		if vim.api.nvim_get_option_value("filetype", { buf = b }) == "gitannotate" then
+		if vim.bo[b].filetype == "gitannotate" then
 			vim.api.nvim_win_close(w, true)
 			return
 		end
@@ -1033,42 +1164,72 @@ function M.annotate()
 		vim.notify("Git annotate: No file associated with current buffer", vim.log.levels.WARN)
 		return
 	end
-
-	-- 记录主窗口状态（异步回调前快照，避免用户切换窗口后状态错乱）
 	local main_win = vim.api.nvim_get_current_win()
-	local top = vim.fn.line("w0") + vim.wo.scrolloff
-	local current_line = vim.fn.line(".")
+	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+	local request = {}
+	pending_request = request
+	local function request_is_valid()
+		return pending_request == request
+			and vim.api.nvim_win_is_valid(main_win)
+			and vim.api.nvim_buf_is_valid(bufnr)
+			and vim.api.nvim_win_get_buf(main_win) == bufnr
+			and vim.api.nvim_buf_get_name(bufnr) == filename
+			and vim.api.nvim_buf_get_changedtick(bufnr) == changedtick
+			and vim.api.nvim_get_current_win() == main_win
+	end
+	local function finish()
+		if pending_request == request then
+			pending_request = nil
+		end
+	end
 
 	vim.notify("Git annotate: loading…", vim.log.levels.INFO)
-
-	-- 异步执行 git blame，避免大文件时阻塞 Neovim 事件循环
-	vim.system(
-		{ "git", "blame", "--line-porcelain", filename },
-		{ text = true },
-		vim.schedule_wrap(function(result)
-			if result.code ~= 0 then
+	request.process = vim.system(
+		{ "git", "rev-parse", "--show-toplevel" },
+		{
+			text = true,
+			cwd = vim.fn.fnamemodify(filename, ":h"),
+		},
+		vim.schedule_wrap(function(root_result)
+			if not request_is_valid() then
+				finish()
+				return
+			end
+			if root_result.code ~= 0 then
+				finish()
 				vim.notify(
-					"Git annotate: git blame failed\n" .. (result.stderr or ""),
+					"Git annotate: " .. (root_result.stderr or "failed to find repository"),
 					vim.log.levels.ERROR
 				)
 				return
 			end
-
-			local blame_output = vim.split(result.stdout, "\n", { plain = true })
-			local annotations = parse_blame(blame_output)
-			if #annotations == 0 then
-				vim.notify("Git annotate: no blame data", vim.log.levels.WARN)
-				return
-			end
-
-			-- 确认主窗口仍有效（异步期间用户可能已关闭）
-			if not vim.api.nvim_win_is_valid(main_win) then
-				vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
-				return
-			end
-			vim.api.nvim_set_current_win(main_win)
-
-			M._open_sidebar(annotations, bufnr, main_win, top, current_line)
+			local cwd = root_result.stdout:gsub("\n$", "")
+			request.process = vim.system(
+				{ "git", "blame", "--line-porcelain", "--", filename },
+				{
+					text = true,
+					cwd = cwd,
+				},
+				vim.schedule_wrap(function(result)
+					if not request_is_valid() then
+						finish()
+						return
+					end
+					finish()
+					if result.code ~= 0 then
+						vim.notify("Git annotate: git blame failed\n" .. (result.stderr or ""), vim.log.levels.ERROR)
+						return
+					end
+					local annotations = parse_blame(vim.split(result.stdout, "\n", { plain = true }))
+					if #annotations == 0 then
+						vim.notify("Git annotate: no blame data", vim.log.levels.WARN)
+						return
+					end
+					local top = vim.fn.line("w0") + vim.wo.scrolloff
+					local current_line = math.min(vim.fn.line("."), #annotations)
+					M._open_sidebar(annotations, bufnr, main_win, top, current_line, cwd)
+				end)
+			)
 		end)
 	)
 end
