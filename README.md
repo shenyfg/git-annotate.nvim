@@ -33,8 +33,8 @@ Run `:lua require("git_annotate").annotate()` or use your keymap to toggle and a
 | `d` | Show changed files, repository commit history and per-file diff in Snacks |
 | `]]` | Jump to the next occurrence of the same commit in the file |
 | `[[` | Jump to the previous occurrence of the same commit in the file |
-| `]c` | Jump to the start of the next commit block |
-| `[c` | Jump to the start of the previous commit block |
+| `]c` | Jump to the next commit's first occurrence (skip repeated commit blocks) |
+| `[c` | Jump to the previous commit's first occurrence (skip repeated commit blocks) |
 
 > `d` requires [snacks.nvim](https://github.com/folke/snacks.nvim). The picker starts on the current file when possible and previews the selected file's diff. Untracked files are also available through their per-file preview.
 

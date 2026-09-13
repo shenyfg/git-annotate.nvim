@@ -1170,34 +1170,35 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 		end
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev hunk of same commit" })
 
-	-- ]c / [c：跳转到下一个/上一个不同 commit 块的起始行
+	-- 每个 commit 只保留在文件中首次出现的行，按行号顺序跳转。
+	local commit_starts, seen = {}, {}
+	for lnum, annotation in ipairs(annotations) do
+		if not seen[annotation.sha] then
+			seen[annotation.sha] = true
+			commit_starts[#commit_starts + 1] = lnum
+		end
+	end
+
+	-- ]c / [c：在各个 commit 首次出现的行之间跳转
 	vim.keymap.set("n", "]c", function()
 		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local sha = annotations[lnum] and annotations[lnum].sha
-		local i = lnum + 1
-		while i <= #annotations and annotations[i].sha == sha do
-			i = i + 1
+		for _, start in ipairs(commit_starts) do
+			if start > lnum then
+				jump_to(start)
+				return
+			end
 		end
-		if i <= #annotations then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next commit block" })
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next unique commit start" })
 
 	vim.keymap.set("n", "[c", function()
 		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
-		local sha = annotations[lnum] and annotations[lnum].sha
-		local i = lnum - 1
-		while i >= 1 and annotations[i].sha == sha do
-			i = i - 1
+		for i = #commit_starts, 1, -1 do
+			if commit_starts[i] < lnum then
+				jump_to(commit_starts[i])
+				return
+			end
 		end
-		local prev_sha = i >= 1 and annotations[i].sha or nil
-		while i > 1 and annotations[i - 1].sha == prev_sha do
-			i = i - 1
-		end
-		if i >= 1 and prev_sha then
-			jump_to(i)
-		end
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev commit block" })
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev unique commit start" })
 
 	-- K: 浮动窗口展示简要 commit 信息
 	vim.keymap.set("n", "K", function()

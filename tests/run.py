@@ -54,6 +54,53 @@ local function hold_exits()
 end
 '''
 CASES = {
+    'commit navigation visits only first occurrences and synchronizes both windows': r'''
+local main = vim.api.nvim_get_current_win()
+local annotations = {}
+for i, sha in ipairs({'a', 'a', 'b', 'b', 'a', 'c', 'c', 'b', 'd', 'a'}) do
+  annotations[i] = {sha=sha, text=sha, author_time=0, uncommitted=false}
+end
+M._open_sidebar(annotations, vim.api.nvim_get_current_buf(), main, 1, 1, REPO)
+local sidebar = vim.api.nvim_get_current_win()
+local function move(lhs, expected)
+  key(lhs)
+  assert(vim.api.nvim_win_get_cursor(sidebar)[1] == expected, lhs .. ': sidebar')
+  assert(vim.api.nvim_win_get_cursor(main)[1] == expected, lhs .. ': source')
+end
+local function position(row)
+  vim.api.nvim_win_set_cursor(sidebar, {row, 0})
+  vim.api.nvim_win_set_cursor(main, {row, 0})
+end
+move('[c', 1)
+for _, row in ipairs({3, 6, 9, 9}) do move(']c', row) end
+for _, row in ipairs({6, 3, 1, 1}) do move('[c', row) end
+-- Manual movement inside initial and repeated blocks uses the nearest first occurrence.
+position(4)
+move('[c', 3)
+position(5)
+move(']c', 6)
+position(8)
+move('[c', 6)
+position(10)
+move(']c', 10)
+move('[c', 9)
+-- Same-commit navigation still visits repeated blocks.
+position(1)
+move(']]', 5)
+move(']]', 10)
+move('[[', 5)
+move('[[', 1)
+key('q')
+-- A file containing just one commit has only one navigation target.
+for _, annotation in ipairs(annotations) do annotation.sha = 'a' end
+M._open_sidebar(annotations, vim.api.nvim_get_current_buf(), main, 1, 1, REPO)
+sidebar = vim.api.nvim_get_current_win()
+move(']c', 1)
+move('[c', 1)
+position(5)
+move(']c', 5)
+move('[c', 1)
+''',
     'repository cwd is retained for blame and K': r'''
 vim.cmd.cd('/tmp')
 open()

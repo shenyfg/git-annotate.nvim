@@ -35,8 +35,8 @@ Annotate your code like PyCharm/IntelliJ — in Neovim.
 | `d` | 用 Snacks 展示变更文件、仓库提交历史和单文件 diff |
 | `]]` | 跳到当前 commit 在文件中的下一个块 |
 | `[[` | 跳到当前 commit 在文件中的上一个块 |
-| `]c` | 跳到下一个不同 commit 块的起始行 |
-| `[c` | 跳到上一个不同 commit 块的起始行 |
+| `]c` | 跳到后方最近的 commit 首次出现行（跳过重复 commit 块） |
+| `[c` | 跳到前方最近的 commit 首次出现行（跳过重复 commit 块） |
 
 > `d` 键依赖 [snacks.nvim](https://github.com/folke/snacks.nvim)。picker 会尽量默认选中当前文件，并预览选中文件的 diff；未跟踪文件也可通过单文件预览查看。
 
