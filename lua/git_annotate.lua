@@ -1,6 +1,7 @@
 local M = {}
 
 local MAX_DIFF_PREVIEW_BYTES = 2 * 1024 * 1024
+local DIFF_LOADING_DELAY_MS = 3000
 local preview_ns = vim.api.nvim_create_namespace("git_annotate_preview")
 local pending_request
 local hover_requests = {}
@@ -156,12 +157,35 @@ local function is_uncommitted(sha)
 	return not sha or sha == "" or sha:match("^0+$")
 end
 
+--- 在默认浏览器中打开提交，复用 Snacks 的远程地址与托管平台适配
+--- @param sha? string
+--- @param main_win integer
+local function open_commit_browser(sha, main_win)
+	if is_uncommitted(sha) then
+		vim.notify("Git annotate: uncommitted changes have no commit page", vim.log.levels.WARN)
+		return
+	end
+	if not vim.api.nvim_win_is_valid(main_win) then
+		vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
+		return
+	end
+	local ok, snacks = pcall(require, "snacks")
+	if not ok or not snacks.gitbrowse then
+		vim.notify("Git annotate: O requires snacks.nvim", vim.log.levels.WARN)
+		return
+	end
+	-- 侧栏和 picker 都是临时 buffer；从源文件窗口解析仓库，避免使用错误的 cwd。
+	vim.api.nvim_win_call(main_win, function()
+		snacks.gitbrowse({ what = "commit", commit = sha })
+	end)
+end
+
 --- 判断 commit 是否为根提交
 --- @param sha string
 --- @param callback fun(root: boolean?, err: string?)
 --- @param cwd? string
 local function is_root_commit(sha, callback, cwd)
-	vim.system(
+	return vim.system(
 		{ "git", "rev-list", "--parents", "-n", "1", sha },
 		{ text = true, cwd = cwd },
 		vim.schedule_wrap(function(result)
@@ -182,20 +206,6 @@ local function is_root_commit(sha, callback, cwd)
 			callback(#commits == 1)
 		end)
 	)
-end
-
---- 生成带大提交保护的 diff 命令
---- @param sha string
---- @param root boolean
---- @return string[]
-local function diff_command(sha, root)
-	if is_uncommitted(sha) then
-		return { "git", "--no-pager", "diff", "HEAD" }
-	end
-	if root then
-		return { "git", "--no-pager", "show", "--no-patch", "--format=fuller", sha }
-	end
-	return { "git", "--no-pager", "show", "--format=fuller", sha }
 end
 
 --- 有界收集命令输出，超过上限后终止子进程
@@ -288,17 +298,12 @@ end
 
 --- 解析 diff 命令输出并添加保护提示
 --- @param output string
---- @param root boolean
 --- @param truncated boolean
 --- @return string[]
-local function diff_lines(output, root, truncated)
+local function diff_lines(output, truncated)
 	local lines = vim.split(output, "\n", { plain = true })
 	if #lines > 0 and lines[#lines] == "" then
 		table.remove(lines)
-	end
-	if root then
-		table.insert(lines, 1, "")
-		table.insert(lines, 1, "[Git annotate: root commit diff omitted to avoid loading the entire repository.]")
 	end
 	if truncated then
 		table.insert(lines, "")
@@ -307,98 +312,56 @@ local function diff_lines(output, root, truncated)
 	return lines
 end
 
---- 解析 commit 对应的受保护 diff 命令
+--- 读取提交信息，供侧边栏与 picker 共用
 --- @param sha string
---- @param callback fun(command: string[]?, root: boolean?, err: string?)
---- @param cwd? string
-local function resolve_diff_command(sha, callback, cwd)
+--- @param cwd string
+--- @param callback fun(lines: string[]?, err?: string)
+--- @return vim.SystemObj?
+local function load_commit_info(sha, cwd, callback)
 	if is_uncommitted(sha) then
-		callback(diff_command(sha, false), false)
+		callback({ "Not committed yet" })
 		return
 	end
-
-	is_root_commit(sha, function(root, err)
-		if root == nil then
-			callback(nil, nil, err)
+	return collect_bounded({
+		"git",
+		"show",
+		"--no-patch",
+		"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
+		"--date=format-local:%Y-%m-%d %H:%M",
+		sha,
+	}, function(result)
+		if result.code ~= 0 and not result.truncated then
+			callback(nil, result.stderr ~= "" and result.stderr or "failed to load commit info")
 			return
 		end
-		callback(diff_command(sha, root), root)
+		local lines = vim.split(result.stdout, "\n", { plain = true })
+		while #lines > 1 and lines[#lines] == "" do
+			table.remove(lines)
+		end
+		if result.truncated then
+			table.insert(lines, "[Git annotate: commit info truncated at 2 MiB.]")
+		end
+		callback(lines)
 	end, cwd)
 end
 
---- 在主窗口右侧打开或复用 diff buffer
---- @param lines string[]
---- @param buf_name string
---- @param main_win integer
-local function open_buffer_vsplit(lines, buf_name, main_win)
-	if not vim.api.nvim_win_is_valid(main_win) then
-		vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
-		return
+--- 文件列表标题使用作者与本地时间；完整信息仍通过 K 查看
+local function commit_files_title(lines)
+	local author = lines and lines[2] and lines[2]:match("^author:%s*(.*)")
+	local date, time
+	if lines and lines[3] then
+		date, time = lines[3]:match("^date:%s*(%d%d%d%d%-%d%d%-%d%d) (%d%d:%d%d)$")
 	end
-
-	local commit_buf
-	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_get_name(buf) == buf_name then
-			commit_buf = buf
-			break
-		end
+	if not author or not date then
+		return "Commit info unavailable"
 	end
-
-	if not commit_buf then
-		commit_buf = vim.api.nvim_create_buf(false, true)
-		vim.api.nvim_buf_set_name(commit_buf, buf_name)
+	-- Omit the email address in the compact title.
+	author = author:gsub("%s*<[^<>]*>$", "")
+	if date == os.date("%Y-%m-%d") then
+		return author .. "  Today " .. time
 	end
-
-	local cbo = vim.bo[commit_buf]
-	cbo.modifiable = true
-	vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, lines)
-	cbo.modifiable = false
-	cbo.buftype = "nofile"
-	cbo.bufhidden = "wipe"
-	cbo.filetype = "git"
-
-	vim.api.nvim_set_current_win(main_win)
-	vim.cmd.vsplit({ mods = { keepalt = true } })
-	vim.api.nvim_win_set_buf(0, commit_buf)
-end
-
---- 在 vsplit 中异步打开受保护的 git show / git diff 内容
---- @param sha string
---- @param main_win integer
---- @param cwd? string
-local function open_diff_vsplit(sha, main_win, cwd)
-	if not vim.api.nvim_win_is_valid(main_win) then
-		vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
-		return
-	end
-	local source_buf = vim.api.nvim_win_get_buf(main_win)
-	local function source_is_valid()
-		return vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_get_buf(main_win) == source_buf
-	end
-
-	resolve_diff_command(sha, function(command, root, err)
-		if not source_is_valid() then
-			return
-		end
-		if not command then
-			vim.notify("Git annotate: " .. (err or "failed to build diff command"), vim.log.levels.ERROR)
-			return
-		end
-		collect_bounded(command, function(result)
-			if not source_is_valid() then
-				return
-			end
-			if result.code ~= 0 and not result.truncated then
-				local message = result.stderr ~= "" and result.stderr or "git diff failed"
-				vim.notify("Git annotate: " .. message, vim.log.levels.ERROR)
-				return
-			end
-
-			local buf_name = is_uncommitted(sha) and "git-annotate://diff (working tree)"
-				or "git-annotate://show/" .. sha:sub(1, 8)
-			open_buffer_vsplit(diff_lines(result.stdout, root == true, result.truncated), buf_name, main_win)
-		end, cwd)
-	end, cwd)
+	local year, month, day = date:match("(%d+)%-(%d+)%-(%d+)")
+	return string.format("%s  %d/%d/%d, %s", author, tonumber(year), tonumber(month), tonumber(day), time)
 end
 
 --- 在浮动窗口中展示简要 commit 信息
@@ -407,13 +370,19 @@ end
 --- @param ann_buf integer
 --- @param cwd string
 local function show_commit_float(sha, ann_win, ann_buf, cwd)
-	if hover_requests[ann_buf] then
-		hover_requests[ann_buf]()
+	local cursor = vim.api.nvim_win_get_cursor(ann_win)
+	local active = hover_requests[ann_buf]
+	if active then
+		if active.sha == sha and vim.deep_equal(active.cursor, cursor) then
+			active.focus()
+			return
+		end
+		active.close()
 	end
 
 	local closed = false
 	local float_win, process
-	local cursor = vim.api.nvim_win_get_cursor(ann_win)
+	local focus_requested = false
 	local group = vim.api.nvim_create_augroup("GitAnnotateHover" .. ann_buf, { clear = true })
 	local function close()
 		if closed then
@@ -429,11 +398,30 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			vim.api.nvim_win_close(float_win, true)
 		end
 	end
-	hover_requests[ann_buf] = close
-	vim.api.nvim_create_autocmd({ "CursorMoved", "BufLeave", "WinLeave", "BufWipeout" }, {
+	local function focus()
+		focus_requested = true
+		if float_win and vim.api.nvim_win_is_valid(float_win) then
+			vim.api.nvim_set_current_win(float_win)
+		end
+	end
+	hover_requests[ann_buf] = { close = close, focus = focus, sha = sha, cursor = cursor }
+	local function close_after_leave()
+		-- Wait until the destination window is known, allowing sidebar -> hover focus.
+		vim.schedule(function()
+			if not closed and vim.api.nvim_get_current_win() ~= float_win then
+				close()
+			end
+		end)
+	end
+	vim.api.nvim_create_autocmd({ "CursorMoved", "BufWipeout" }, {
 		buffer = ann_buf,
 		group = group,
 		callback = close,
+	})
+	vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
+		buffer = ann_buf,
+		group = group,
+		callback = close_after_leave,
 	})
 	vim.api.nvim_create_autocmd("WinClosed", {
 		pattern = tostring(ann_win),
@@ -478,7 +466,21 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			border = "rounded",
 			zindex = 50,
 		})
-		vim.wo[float_win].wrap = false
+		vim.wo[float_win].wrap = true
+		local function dismiss()
+			close()
+			if vim.api.nvim_win_is_valid(ann_win) and vim.api.nvim_win_get_buf(ann_win) == ann_buf then
+				vim.api.nvim_set_current_win(ann_win)
+			end
+		end
+		for _, key in ipairs({ "q", "<Esc>", "K" }) do
+			vim.keymap.set("n", key, dismiss, { buffer = float_buf, silent = true, desc = "Close commit info" })
+		end
+		vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
+			buffer = float_buf,
+			group = group,
+			callback = close_after_leave,
+		})
 		vim.api.nvim_create_autocmd("WinClosed", {
 			pattern = tostring(float_win),
 			group = group,
@@ -487,31 +489,23 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 				close()
 			end,
 		})
+		if focus_requested then
+			focus()
+		end
 	end
 
-	if is_uncommitted(sha) then
-		show({ "Not committed yet" })
-		return
-	end
-	process = collect_bounded({
-		"git",
-		"show",
-		"--no-patch",
-		"--format=commit %h%nauthor:  %an <%ae>%ndate:    %ad%n%n%s%n%b",
-		"--date=format:%Y-%m-%d %H:%M",
-		sha,
-	}, function(result)
+	process = load_commit_info(sha, cwd, function(lines, err)
 		process = nil
 		if closed then
 			return
 		end
-		if result.code ~= 0 and not result.truncated then
+		if not lines then
 			close()
-			vim.notify("Git annotate: " .. result.stderr, vim.log.levels.ERROR)
+			vim.notify("Git annotate: " .. err, vim.log.levels.ERROR)
 			return
 		end
-		show(diff_lines(result.stdout, false, result.truncated))
-	end, cwd)
+		show(lines)
+	end)
 end
 
 --- 使用 Snacks 与 git status 相同的 diff 风格渲染已收集的内容
@@ -581,35 +575,62 @@ local function diff_succeeded(result, allow_exit_one)
 	return result.code == 0 or result.truncated or (allow_exit_one and result.code == 1)
 end
 
+--- diff 标题仅展示提交主题，文件路径由 diff 内容展示
+local function commit_preview_title(state)
+	local title = state.working and "Working Tree · Not committed yet" or state.subject or "Loading commit info…"
+	return title .. (state.preview_truncated and " [truncated]" or "")
+end
+
 --- 为 Snacks picker 异步预览选中文件，并限制最大输出
 --- @param ctx snacks.picker.preview.ctx
 --- @param state {working: boolean, sha?: string, root?: boolean, cwd: string}
 local function preview_file_change(ctx, state)
+	local request = {}
+	state.preview_request = request
+	if state.loading then
+		ctx.preview:reset()
+		ctx.preview:set_title(commit_preview_title(state))
+		ctx.preview:set_lines({ "Loading changed files…" })
+		return
+	end
 	if not ctx.item.file then
 		ctx.preview:notify("file is missing", "error", { item = false })
 		return
 	end
 
-	local title = (state.working and "Working Tree · " or "Commit " .. state.sha:sub(1, 8) .. " · ") .. ctx.item.file
+	local revision = state.revision
+	state.preview_truncated = false
 	ctx.preview:reset()
-	ctx.preview:set_title(title)
-	ctx.preview:set_lines({ "Loading diff…" })
+	ctx.preview:set_title(commit_preview_title(state))
 
 	local function preview_is_valid()
-		return ctx.preview.item == ctx.item and ctx.preview.win:buf_valid()
+		return not ctx.picker.closed
+			and state.revision == revision
+			and state.preview_request == request
+			and ctx.preview.item == ctx.item
+			and ctx.preview.win:buf_valid()
 	end
+
+	-- 快速切换时不显示加载提示；过期或已完成的请求不能覆盖当前预览。
+	local completed = false
+	vim.defer_fn(function()
+		if not completed and preview_is_valid() then
+			ctx.preview:set_lines({ "Loading diff…" })
+		end
+	end, DIFF_LOADING_DELAY_MS)
 
 	local function show_error(message)
 		if not preview_is_valid() then
 			return
 		end
 		ctx.preview:reset()
-		ctx.preview:set_title(title)
+		ctx.preview:set_title(commit_preview_title(state))
 		ctx.preview:set_lines({ "Git annotate: " .. message })
 	end
 
 	local command, allow_exit_one = file_diff_command(state, ctx.item)
 	collect_bounded(command, function(result)
+		completed = true
 		if not preview_is_valid() then
 			return
 		end
@@ -618,34 +639,10 @@ local function preview_file_change(ctx, state)
 			return
 		end
 
-		render_commit_preview(ctx, diff_lines(result.stdout, false, result.truncated))
-		ctx.preview:set_title(title .. (result.truncated and " [truncated]" or ""))
-	end, state.cwd)
-end
-
---- 在 vsplit 中打开选中文件的 diff
---- @param state {working: boolean, sha?: string, root?: boolean, cwd: string}
---- @param item table
---- @param main_win integer
-local function open_file_diff_vsplit(state, item, main_win)
-	if not item or not item.file or not vim.api.nvim_win_is_valid(main_win) then
-		return
-	end
-	local source_buf = vim.api.nvim_win_get_buf(main_win)
-	local command, allow_exit_one = file_diff_command(state, item)
-	collect_bounded(command, function(result)
-		if not vim.api.nvim_win_is_valid(main_win) or vim.api.nvim_win_get_buf(main_win) ~= source_buf then
-			return
-		end
-		if not diff_succeeded(result, allow_exit_one) then
-			local message = result.stderr ~= "" and result.stderr or "git diff failed"
-			vim.notify("Git annotate: " .. message, vim.log.levels.ERROR)
-			return
-		end
-
-		local prefix = state.working and "git-annotate://diff (working tree)/"
-			or "git-annotate://show/" .. state.sha:sub(1, 8) .. "/"
-		open_buffer_vsplit(diff_lines(result.stdout, false, result.truncated), prefix .. item.file, main_win)
+		render_commit_preview(ctx, diff_lines(result.stdout, result.truncated))
+		state.preview_truncated = result.truncated
+		ctx.preview:set_title(commit_preview_title(state))
+		ctx.picker:update_titles()
 	end, state.cwd)
 end
 
@@ -689,7 +686,12 @@ end
 --- @param cwd string
 --- @param callback fun(items: table[]?, root: boolean?, err: string?, truncated: boolean?)
 local function load_commit_files(sha, cwd, callback)
-	is_root_commit(sha, function(root, err)
+	local cancelled = false
+	local process
+	process = is_root_commit(sha, function(root, err)
+		if cancelled then
+			return
+		end
 		if root == nil then
 			callback(nil, nil, err)
 			return
@@ -713,7 +715,10 @@ local function load_commit_files(sha, cwd, callback)
 			command = { "git", "--no-pager", "diff", "--name-status", "-z", "-M", sha .. "^", sha }
 		end
 
-		collect_bounded(command, function(result)
+		process = collect_bounded(command, function(result)
+			if cancelled then
+				return
+			end
 			if result.code ~= 0 and not result.truncated then
 				callback(nil, root, result.stderr ~= "" and result.stderr or "git diff failed")
 				return
@@ -721,6 +726,12 @@ local function load_commit_files(sha, cwd, callback)
 			callback(parse_changed_files(result.stdout, cwd), root, nil, result.truncated)
 		end, cwd)
 	end, cwd)
+	return function()
+		cancelled = true
+		if process then
+			pcall(process.kill, process, 15)
+		end
+	end
 end
 
 --- @param cwd string
@@ -738,8 +749,11 @@ end
 --- @param source_file string
 --- @param fallback_cwd string
 --- @param attempt? integer
-local function focus_picker_file(picker, source_file, fallback_cwd, attempt)
+local function focus_picker_file(picker, source_file, fallback_cwd, attempt, valid)
 	if picker.closed then
+		return
+	end
+	if valid and not valid() then
 		return
 	end
 	attempt = attempt or 1
@@ -757,7 +771,7 @@ local function focus_picker_file(picker, source_file, fallback_cwd, attempt)
 
 	if attempt < 50 then
 		vim.defer_fn(function()
-			focus_picker_file(picker, source_file, fallback_cwd, attempt + 1)
+			focus_picker_file(picker, source_file, fallback_cwd, attempt + 1, valid)
 		end, 20)
 	end
 end
@@ -769,54 +783,271 @@ end
 --- @param source_file string
 --- @return table
 local function change_picker_opts(state, ann_win, main_win, source_file)
-	local opening_vsplit = false
-
-	local function open_selected(picker)
-		local item = picker:current()
-		if not item then
-			return
-		end
-		opening_vsplit = true
-		picker:close()
-		open_file_diff_vsplit(state, item, main_win)
+	local info_lines, info_process, info_float
+	local info_request = 0
+	local files_cancel, active_picker
+	local switch_commit
+	state.revision = 0
+	local history = require("git_annotate.history").new({
+		cwd = state.cwd,
+		sha = state.sha,
+		working = state.working,
+		run = collect_bounded,
+		on_select = function(item)
+			if active_picker and not active_picker.closed then
+				switch_commit(active_picker, item)
+			end
+		end,
+	})
+	if state.working then
+		info_lines = { "Working Tree", "Not committed yet" }
 	end
 
-	local function open_whole(picker)
-		opening_vsplit = true
-		picker:close()
-		open_diff_vsplit(state.working and "" or state.sha, main_win, state.cwd)
+	local function set_info_lines(win, lines)
+		if win and win:buf_valid() then
+			vim.bo[win.buf].modifiable = true
+			vim.api.nvim_buf_set_lines(win.buf, 0, -1, false, lines)
+			vim.bo[win.buf].modifiable = false
+		end
+	end
+
+	local function load_info(picker)
+		info_request = info_request + 1
+		local request = info_request
+		if info_process then
+			pcall(info_process.kill, info_process, 15)
+			info_process = nil
+		end
+		if info_lines then
+			picker.title = state.working and "Working Tree Changes" or commit_files_title(info_lines)
+			picker:update_titles()
+			set_info_lines(info_float, info_lines)
+			return
+		end
+		set_info_lines(info_float, { "Loading commit info…" })
+		info_process = load_commit_info(state.sha, state.cwd, function(lines, err)
+			if picker.closed or request ~= info_request then
+				return
+			end
+			info_process = nil
+			info_lines = lines or vim.split("Git annotate: " .. err, "\n", { plain = true, trimempty = true })
+			picker.title = commit_files_title(lines)
+			state.subject = lines and (lines[5] and lines[5] ~= "" and lines[5] or "(No commit message)")
+				or state.subject
+				or "Commit info unavailable · K: details"
+			picker.preview:set_title(commit_preview_title(state))
+			picker:update_titles()
+			set_info_lines(info_float, info_lines)
+		end)
+	end
+
+	switch_commit = function(picker, item)
+		state.revision = state.revision + 1
+		local revision = state.revision
+		local function valid()
+			return not picker.closed and state.revision == revision
+		end
+		if files_cancel then
+			files_cancel()
+			files_cancel = nil
+		end
+		state.sha, state.working, state.root = item.sha, item.working == true, nil
+		state.subject, state.preview_truncated = item.subject, false
+		state.items, state.loading = {}, not state.working
+		info_lines = state.working and { "Working Tree", "Not committed yet" } or nil
+		picker.title = state.working and "Working Tree Changes" or "Loading commit info…"
+		picker.preview.item = nil
+		picker.preview:reset()
+		picker.input:set("", "")
+		picker.list:set_selected()
+		picker.list:clear()
+		local function refresh(message)
+			picker:find({
+				on_done = function()
+					if not valid() then
+						return
+					end
+					picker.list:view(1)
+					if picker.list:count() > 0 then
+						focus_picker_file(picker, source_file, state.cwd, nil, valid)
+						picker:show_preview()
+					else
+						picker.preview:reset()
+						picker.preview:set_title(commit_preview_title(state))
+						picker.preview:set_lines(vim.split(message or "No changed files", "\n", { plain = true }))
+						picker:update_titles()
+					end
+				end,
+			})
+		end
+		refresh(state.loading and "Loading changed files…" or nil)
+		load_info(picker)
+		if state.working then
+			return
+		end
+		files_cancel = load_commit_files(state.sha, state.cwd, function(items, root, err, truncated)
+			if not valid() then
+				return
+			end
+			files_cancel = nil
+			state.loading, state.root, state.items = false, root, items or {}
+			if truncated then
+				vim.notify("Git annotate: changed file list truncated at 2 MiB", vim.log.levels.WARN)
+			end
+			refresh(err and "Git annotate: " .. err or nil)
+		end)
+	end
+
+	local function show_info(picker)
+		if info_float and info_float:win_valid() then
+			info_float:focus()
+			return
+		end
+		local origin = vim.api.nvim_get_current_win()
+		info_float = Snacks.win({
+			text = info_lines or { "Loading commit info…" },
+			enter = true,
+			width = 0.75,
+			height = 0.6,
+			border = "rounded",
+			title = " Commit Info ",
+			zindex = picker.layout.root.opts.zindex + 10,
+			bo = { filetype = "git", modifiable = false, bufhidden = "wipe" },
+			wo = { wrap = true },
+			keys = { q = "close", ["<Esc>"] = "close", K = "close" },
+			on_close = function()
+				if not picker.closed and vim.api.nvim_win_is_valid(origin) then
+					vim.api.nvim_set_current_win(origin)
+				end
+			end,
+		})
+	end
+
+	local preview_origin, preview_origin_mode = "list", "n"
+	local function toggle_diff_focus(picker)
+		local current = picker:current_win()
+		if current ~= "preview" then
+			preview_origin = current == "input" and "input" or "list"
+			preview_origin_mode = vim.fn.mode():sub(1, 1)
+			vim.cmd.stopinsert()
+			picker:focus("preview", { show = true })
+			return
+		end
+		local origin, mode = preview_origin, preview_origin_mode
+		picker:focus(origin, { show = true })
+		vim.schedule(function()
+			if picker.closed or picker:current_win() ~= origin then
+				return
+			end
+			if origin == "input" and mode == "i" then
+				vim.cmd.startinsert({ bang = true })
+			else
+				vim.cmd.stopinsert()
+			end
+		end)
 	end
 
 	local function keys()
 		return {
-			["s"] = {
-				"git_annotate_open_selected",
-				mode = "n",
-				desc = "Open selected file diff in vsplit",
+			["<C-o>"] = {
+				"git_annotate_toggle_diff",
+				mode = { "i", "n" },
+				desc = "Toggle files/input and diff preview",
 			},
-			["S"] = { "git_annotate_open_whole", mode = "n", desc = "Open complete diff in vsplit" },
+			["h"] = { "git_annotate_older", mode = "n", desc = "Show older commit" },
+			["l"] = { "git_annotate_newer", mode = "n", desc = "Show newer commit" },
+			["K"] = { "git_annotate_info", mode = "n", desc = "Show complete commit info" },
+			["O"] = { "git_annotate_browse", mode = "n", desc = "Open commit in browser" },
 		}
 	end
 
 	return {
-		title = state.working and "Working Tree Changes" or "Commit " .. state.sha:sub(1, 8) .. " Changes",
+		title = state.working and "Working Tree Changes" or "Loading commit info…",
 		cwd = state.cwd,
 		focus = "list",
 		format = "file",
+		show_empty = true,
+		finder = function(opts, ctx)
+			if state.working then
+				return require("snacks.picker.source.git").status(opts, ctx)
+			end
+			return state.items or {}
+		end,
+		layout = function()
+			local wide = vim.o.columns >= 100
+			return {
+				preview = true,
+				layout = {
+					box = wide and "horizontal" or "vertical",
+					width = 0.9,
+					height = 0.85,
+					{
+						box = "vertical",
+						{
+							box = "vertical",
+							border = "rounded",
+							title = "{title}",
+							{ win = "input", height = 1, border = "bottom" },
+							{ win = "list", border = "none" },
+						},
+						history:layout(wide and 0.45 or 0.5),
+					},
+					{
+						win = "preview",
+						title = "{preview}",
+						border = "rounded",
+						width = wide and 0.6 or nil,
+						height = not wide and 0.6 or nil,
+					},
+				},
+			}
+		end,
 		preview = function(ctx)
 			preview_file_change(ctx, state)
 		end,
 		actions = {
-			git_annotate_open_selected = open_selected,
-			git_annotate_open_whole = open_whole,
+			git_annotate_toggle_diff = toggle_diff_focus,
+			git_annotate_older = function()
+				history:move(1)
+			end,
+			git_annotate_newer = function()
+				history:move(-1)
+			end,
+			git_annotate_info = show_info,
+			git_annotate_browse = function()
+				open_commit_browser(state.working and "" or state.sha, main_win)
+			end,
 		},
-		confirm = "git_annotate_open_selected",
+		confirm = "git_annotate_toggle_diff",
 		on_show = function(picker)
-			focus_picker_file(picker, source_file, state.cwd)
+			active_picker = picker
+			local revision = state.revision
+			focus_picker_file(picker, source_file, state.cwd, nil, function()
+				return state.revision == revision
+			end)
+			if state.loading then
+				switch_commit(picker, { sha = state.sha, working = state.working, subject = state.subject })
+			else
+				load_info(picker)
+			end
+			history.closed = false
+			history:load()
 		end,
 		on_close = function()
-			if opening_vsplit then
-				return
+			state.revision = state.revision + 1
+			history:close()
+			if files_cancel then
+				files_cancel()
+				files_cancel = nil
+			end
+			info_request = info_request + 1
+			if info_process then
+				pcall(info_process.kill, info_process, 15)
+				info_process = nil
+			end
+			if info_float then
+				info_float:close()
+				info_float = nil
 			end
 			vim.schedule(function()
 				if vim.api.nvim_win_is_valid(ann_win) then
@@ -845,17 +1076,17 @@ local function open_change_picker(sha, ann_win, main_win, cwd)
 
 	local ok, snacks = pcall(require, "snacks")
 	if not ok or not snacks.picker then
-		vim.notify("Git annotate: d requires snacks.nvim; use s to open the diff", vim.log.levels.WARN)
+		vim.notify("Git annotate: d requires snacks.nvim", vim.log.levels.WARN)
 		return
 	end
 	local source_buf = vim.api.nvim_win_get_buf(main_win)
 	local source_file = vim.api.nvim_buf_get_name(source_buf)
 	local working = is_uncommitted(sha)
-	local state = { working = working, sha = working and nil or sha, cwd = cwd }
+	local state = { working = working, sha = not working and sha or nil, cwd = cwd }
 
 	if working then
 		vim.api.nvim_set_current_win(main_win)
-		snacks.picker.git_status(change_picker_opts(state, ann_win, main_win, source_file))
+		snacks.picker.pick(change_picker_opts(state, ann_win, main_win, source_file))
 		return
 	end
 
@@ -870,15 +1101,11 @@ local function open_change_picker(sha, ann_win, main_win, cwd)
 			vim.notify("Git annotate: " .. (err or "failed to load changed files"), vim.log.levels.ERROR)
 			return
 		end
-		if #items == 0 then
-			vim.notify("Git annotate: commit has no changed files", vim.log.levels.WARN)
-			return
-		end
 		if truncated then
 			vim.notify("Git annotate: changed file list truncated at 2 MiB", vim.log.levels.WARN)
 		end
 
-		state.root = root
+		state.root, state.items = root, items
 		vim.api.nvim_set_current_win(main_win)
 		local opts = change_picker_opts(state, ann_win, main_win, source_file)
 		opts.items = items
@@ -977,10 +1204,9 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 		show_commit_float(cur_sha(), ann_win, ann_buf, cwd)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
 
-	-- s: 在 vsplit 中直接展示 git show 内容
-	vim.keymap.set("n", "s", function()
-		open_diff_vsplit(cur_sha(), main_win, cwd)
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit diff (vsplit)" })
+	vim.keymap.set("n", "O", function()
+		open_commit_browser(cur_sha(), main_win)
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Open commit in browser" })
 
 	-- d: 用 Snacks picker 展示变更文件列表与 diff
 	vim.keymap.set("n", "d", function()
@@ -1083,7 +1309,7 @@ function M._open_sidebar(annotations, bufnr, main_win, top, current_line, cwd)
 		cleaned = true
 		vim.api.nvim_del_augroup_by_id(group)
 		if hover_requests[ann_buf] then
-			hover_requests[ann_buf]()
+			hover_requests[ann_buf].close()
 		end
 		if vim.api.nvim_win_is_valid(main_win) then
 			main_wlo.scrollbind = orig_scrollbind
