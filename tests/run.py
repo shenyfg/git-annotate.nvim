@@ -283,7 +283,10 @@ local function output(first, last)
   local fields = {}
   for i = first, last do
     fields[#fields + 1] = sha(i)
+    fields[#fields + 1] = sha(i):sub(1, 7)
+    fields[#fields + 1] = '2 minutes ago'
     fields[#fields + 1] = i == 205 and '' or 'Commit ' .. i
+    fields[#fields + 1] = 'Test Author'
   end
   return table.concat(fields, '\0') .. '\0'
 end
@@ -324,7 +327,10 @@ local function output(first, last)
   local fields = {}
   for i = first, last do
     fields[#fields + 1] = sha(i)
+    fields[#fields + 1] = sha(i):sub(1, 7)
+    fields[#fields + 1] = '2 minutes ago'
     fields[#fields + 1] = 'Commit ' .. i
+    fields[#fields + 1] = 'Test Author'
   end
   return table.concat(fields, '\0') .. '\0'
 end
@@ -345,6 +351,50 @@ assert(history.index == 199 and selected[#selected] == sha(199))
 history:move(1)
 history:move(1)
 assert(history.index == 201 and selected[#selected] == sha(201))
+history:close()
+'''
+
+CASES['commit filtering loads older pages and applies the latest literal query'] = r'''
+local History = require('git_annotate.history')
+local requests, selected = {}, {}
+local function sha(i) return string.format('%040x', i) end
+local function output(first, last)
+  local fields = {}
+  for i = first, last do
+    local match = i == 205 or i == 407
+    vim.list_extend(fields, {sha(i), sha(i):sub(1, 7), '2 minutes ago',
+      match and 'Fix [x] issue' or 'Other', match and 'Alice' or 'Bob'})
+  end
+  return table.concat(fields, '\0') .. '\0'
+end
+local history = History.new({cwd = REPO, sha = sha(1), working = false,
+  on_select = function(item) selected[#selected + 1] = item.sha end,
+  run = function(command, callback)
+    requests[#requests + 1] = {command = command, callback = callback}
+    return {kill = function() end}
+  end,
+})
+history:load()
+requests[1].callback({code = 0, stdout = output(1, 201), stderr = ''})
+history:set_filter('ALICE [x]')
+assert(#history.visible == 0 and #requests == 2)
+requests[2].callback({code = 0, stdout = output(201, 401), stderr = ''})
+assert(history.index == 205 and #history.visible == 1 and #requests == 3)
+assert(vim.tbl_contains(requests[3].command, '--skip=400'))
+history:set_filter('no-match')
+requests[3].callback({code = 0, stdout = output(401, 410), stderr = ''})
+assert(#history.visible == 0 and not history.more and history.index == 205)
+history:set_filter('alice [x]')
+assert(#history.visible == 2)
+history:move(1)
+assert(history.index == 407)
+history:move(-1)
+assert(history.index == 205)
+history:set_filter(sha(407))
+assert(#history.visible == 1 and history.index == 407)
+history:set_filter('  ', 1)
+assert(#history.visible == 410 and history.index == 1 and history.filter == '')
+assert(selected[#selected] == sha(1))
 history:close()
 '''
 
@@ -383,7 +433,8 @@ local function selected_commit(picker)
   local win = history_win(picker)
   local row = vim.api.nvim_win_get_cursor(win.win)[1]
   local line = vim.api.nvim_buf_get_lines(win.buf, row - 1, row, false)[1]
-  return line:match('^▶ (%x+)') or line:match('^  (%x+)')
+  local sha = line:match(' (%x%x%x%x%x%x%x+) ')
+  return sha and git({'rev-parse', sha}):sub(1, 8)
 end
 local function history_loaded(picker)
   wait_for(function() return selected_commit(picker) or
@@ -427,9 +478,181 @@ local function capture_browser()
   end
   return urls
 end
+local function direct_log()
+  M.log()
+  local picker
+  wait_for(function()
+    picker = Snacks.picker.get()[1]
+    return picker and picker.list.win:win_valid()
+  end)
+  assert(picker.opts.source ~= 'git_log', 'log should open details directly')
+  return picker
+end
+local function filter_text(text)
+  assert(vim.bo.filetype == 'gitannotate_filter')
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, {text})
+  vim.api.nvim_exec_autocmds('TextChangedI', {buffer = 0})
+end
 '''
 
 SNACKS_CASES = {
+    'f filters in place, Enter keeps it, Esc restores it, and clearing shows all commits': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+picker:focus('preview')
+local origin, count = vim.api.nvim_get_current_win(), windows()
+local target = git({'rev-parse', '--short=8', 'HEAD~1'})
+key('f')
+assert(vim.bo.filetype == 'gitannotate_filter' and windows() == count + 1)
+filter_text(target)
+wait_for(function() return selected_commit(picker) == target end)
+diff_loaded(picker)
+assert(preview_title(picker) == git({'show', '--no-patch', '--format=%s', 'HEAD~1'}))
+assert(vim.api.nvim_buf_line_count(history_win(picker).buf) == 2)
+key('<CR>')
+wait_for(function() return windows() == count and vim.api.nvim_get_current_win() == origin end)
+assert(history_win(picker):text():find('Filter: ' .. target, 1, true))
+picker:update_titles()
+assert(history_win(picker):text():find('Filter: ' .. target, 1, true))
+key('f')
+assert(vim.api.nvim_get_current_line() == target)
+filter_text(git({'rev-parse', '--short=8', 'HEAD'}))
+wait_for(function() return selected_commit(picker) ~= target end)
+key('<Esc>')
+wait_for(function() return windows() == count and selected_commit(picker) == target end)
+assert(history_win(picker):text():find('Filter: ' .. target, 1, true))
+key('f')
+filter_text('')
+key('<CR>')
+wait_for(function() return windows() == count end)
+assert(vim.api.nvim_buf_line_count(history_win(picker).buf) > 1)
+assert(not history_win(picker):text():find('Filter:', 1, true))
+picker:close()
+wait_for(function() return windows() == 1 end)
+assert(#Snacks.picker.get() == 0)
+''',
+    'unmatched filter keeps the diff and closing details cleans the filter window': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local text, title = picker.preview.win:text(), preview_title(picker)
+key('f')
+filter_text('definitely-no-such-commit-[%]')
+assert(history_win(picker):text():find('No matching commits', 1, true))
+assert(picker.preview.win:text() == text and preview_title(picker) == title)
+local filter_buf = vim.api.nvim_get_current_buf()
+picker:close()
+wait_for(function() return windows() == 1 end)
+assert(not vim.api.nvim_buf_is_valid(filter_buf))
+assert(#Snacks.picker.get() == 0)
+''',
+    'log opens HEAD directly without checkout or blame and restores the source': r'''
+local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+local system = vim.system
+vim.system = function(command, opts, callback)
+  assert(not vim.tbl_contains(command, 'blame'), 'log must not require blame')
+  assert(not vim.tbl_contains(command, 'checkout'), 'confirm must not checkout')
+  return system(command, opts, callback)
+end
+vim.cmd.cd('/tmp')
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+assert(selected_commit(picker) == git({'rev-parse', '--short=8', 'HEAD'}))
+for _, b in ipairs(vim.api.nvim_list_bufs()) do assert(vim.bo[b].filetype ~= 'gitannotate') end
+local head = selected_commit(picker)
+picker:focus('list')
+key('n')
+wait_for(function() return selected_commit(picker) ~= head end)
+diff_loaded(picker)
+key('p')
+wait_for(function() return selected_commit(picker) == head end)
+diff_loaded(picker)
+key('<C-O>')
+assert(picker:current_win() == 'preview')
+key('<C-O>')
+assert(picker:current_win() == 'list')
+picker:close()
+wait_for(function() return windows() == 1 and vim.api.nvim_get_current_win() == win end)
+assert(vim.api.nvim_get_current_buf() == buf and vim.fn.getcwd() == '/tmp')
+''',
+    'standalone log uses cwd for unnamed and special buffers': r'''
+for _, special in ipairs({false, true}) do
+  vim.cmd.enew()
+  if special then
+    vim.api.nvim_buf_set_name(0, 'test://dashboard')
+    vim.bo.buftype = 'nofile'
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  local picker = direct_log()
+  history_loaded(picker)
+  diff_loaded(picker)
+  assert(selected_commit(picker) == git({'rev-parse', '--short=8', 'HEAD'}))
+  picker:close()
+  wait_for(function() return windows() == 1 and vim.api.nvim_get_current_buf() == buf end)
+end
+''',
+    'detail Enter and o open the selected working tree file without restoring search': r'''
+vim.cmd.cd('/tmp')
+for _, entry in ipairs({{'list', '<CR>'}, {'preview', 'o'}}) do
+  vim.cmd.edit(REPO .. '/README.md')
+  local picker = direct_log()
+  diff_loaded(picker)
+  for index, item in ipairs(picker:items()) do
+    if item.file == 'README_ZH.md' then picker.list:view(index) end
+  end
+  assert(picker:current().file == 'README_ZH.md')
+  picker:focus(entry[1])
+  key(entry[2])
+  wait_for(function() return windows() == 1 end)
+  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/README_ZH.md')
+  assert(#Snacks.picker.get() == 0)
+end
+''',
+    'missing working tree file reports its path and keeps the details open': r'''
+local picker = direct_log()
+diff_loaded(picker)
+local item = picker:current()
+local original = item.file
+local missing = vim.fn.tempname() .. ' deleted file.txt'
+item.file = missing
+picker:focus('preview')
+key('<CR>')
+assert(not picker.closed and picker:current_win() == 'preview')
+assert(notices[#notices]:find('file no longer exists: ' .. missing, 1, true))
+assert(vim.fn.bufnr(missing) == -1, 'missing file must not create a buffer')
+item.file = original
+picker:close()
+''',
+    'log ignores repository lookup results after buffer replacement': r'''
+local release = hold_exits()
+M.log()
+M.log()
+release() -- Superseded repository lookup.
+assert(#Snacks.picker.get() == 0)
+vim.cmd.enew()
+release() -- Latest lookup must not open a picker in the replacement buffer.
+assert(#Snacks.picker.get() == 0 and windows() == 1)
+''',
+    'log cannot open details after the source buffer changes during file loading': r'''
+local release = hold_exits()
+M.log()
+release() -- Resolve HEAD; start parent lookup.
+vim.cmd.enew()
+release() -- Parent lookup starts the changed-file query.
+release() -- Ignore the stale file list.
+assert(#Snacks.picker.get() == 0 and windows() == 1)
+''',
+    'standalone log reports Git errors without opening a picker': r'''
+vim.cmd.enew()
+vim.cmd.cd('/tmp')
+vim.notify = function(msg) table.insert(notices, msg) end
+M.log()
+wait_for(function() return #notices > 0 end)
+assert(notices[#notices]:find('not a git repository', 1, true))
+assert(#Snacks.picker.get() == 0 and windows() == 1)
+''',
     'O browses the sidebar line commit from the source repository and rejects uncommitted lines': r'''
 local urls = capture_browser()
 local older, head = git({'rev-parse', 'HEAD~1'}), git({'rev-parse', 'HEAD'})
@@ -458,7 +681,7 @@ local picker = open_picker(string.rep('0', 40))
 history_loaded(picker)
 key('O')
 assert(#urls == 0 and notices[#notices]:find('uncommitted changes', 1, true))
-key('h')
+key('n')
 diff_loaded(picker)
 local initial = selected_commit(picker)
 local sha = git({'rev-parse', initial})
@@ -472,7 +695,7 @@ for i, pane in ipairs({'list', 'input', 'preview'}) do
   assert(not picker.closed and picker:current_win() == pane)
 end
 assert(vim.fn.getcwd() == cwd, vim.fn.getcwd())
-key('h')
+key('n')
 wait_for(function() return selected_commit(picker) ~= initial end)
 diff_loaded(picker)
 key('O')
@@ -568,19 +791,30 @@ local win = history_win(picker)
 local row = vim.api.nvim_win_get_cursor(win.win)[1]
 local marks = vim.api.nvim_buf_get_extmarks(win.buf, vim.api.nvim_get_namespaces().git_annotate_history,
   {row - 1, 0}, {row - 1, -1}, {details = true})
-assert(#marks == 2 and marks[1][4].line_hl_group == 'Visual')
-assert(marks[2][4].hl_group == 'DiagnosticInfo')
-assert(win:text():find('▶ ' .. sha:sub(1, 8), 1, true))
+local groups, selected = {}, false
+for _, mark in ipairs(marks) do
+  groups[mark[4].hl_group or ''] = true
+  selected = selected or mark[4].line_hl_group == 'Visual'
+end
+assert(selected and groups.DiagnosticInfo)
+assert(groups.SnacksPickerGitCommit and groups.SnacksPickerGitDate and groups.SnacksPickerGitAuthor)
+assert(win:text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', sha}), 1, true))
 local hp = vim.api.nvim_win_get_position(win.win)
 local lp = vim.api.nvim_win_get_position(picker.list.win.win)
 assert(hp[1] > lp[1] and hp[2] + 1 == lp[2])
-assert(win:text():find(git({'rev-parse', '--short=8', 'HEAD'}), 1, true))
+assert(win:text():find(git({'rev-parse', '--short', 'HEAD'}), 1, true))
 local expected = vim.split(git({'log', '--all', '--date-order', '--format=%H', 'HEAD', sha, '--'}), '\n')
 local displayed = vim.api.nvim_buf_get_lines(win.buf, 0, -1, false)
 assert(#displayed == #expected)
 for i, commit in ipairs(expected) do
-  assert(displayed[#displayed - i + 1]:find(commit:sub(1, 8), 1, true))
+  assert(displayed[i]:find(git({'rev-parse', '--short', commit}), 1, true))
 end
+-- Match the default Snacks Git log columns and formatting, including author and human date.
+local fields = vim.split(git({'show', '--no-patch', '--format=%h%x00%ch%x00%s%x00%an', sha}), '\0')
+local expected_line = Snacks.picker.highlight.to_text(Snacks.picker.format.git_log({
+  commit = fields[1], date = fields[2], msg = fields[3], author = fields[4],
+}, picker))
+assert(displayed[row] == '▶ ' .. expected_line)
 local buf = win.buf
 vim.o.columns, vim.o.lines = 80, 28
 vim.api.nvim_exec_autocmds('VimResized', {})
@@ -593,7 +827,7 @@ assert(pos[2] + vim.api.nvim_win_get_width(win.win) < vim.o.columns)
 close_picker(picker)
 assert(not vim.api.nvim_buf_is_valid(buf))
 ''',
-    'h and l update the selected commit, changed files, diff title and K details': r'''
+    'p and n update the selected commit, changed files, diff title and K details': r'''
 local picker = open_picker()
 history_loaded(picker)
 local commits = vim.split(git({'log', '--all', '--date-order', '--format=%H', 'HEAD', '--'}), '\n')
@@ -601,13 +835,13 @@ local index
 for i, sha in ipairs(commits) do if sha == git({'rev-parse', 'HEAD'}) then index = i end end
 local older = commits[index + 1]
 local subject = git({'show', '--no-patch', '--format=%s', older})
-key('h')
+key('n')
 local title = expected_files_title(older)
 wait_for(function() return picker.title == title end)
 diff_loaded(picker)
 assert(selected_commit(picker) == older:sub(1, 8))
-assert(history_win(picker):text():find('▶ ' .. commits[index]:sub(1, 8), 1, true))
-assert(not history_win(picker):text():find('▶ ' .. older:sub(1, 8), 1, true))
+assert(history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', commits[index]}), 1, true))
+assert(not history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', older}), 1, true))
 assert(preview_title(picker) == subject)
 local expected = vim.split(git({'diff-tree', '--no-commit-id', '--name-only', '-r', older}), '\n')
 local files = vim.tbl_map(function(item) return item.file end, picker:items())
@@ -620,7 +854,7 @@ wait_for(function() return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1]:find(o
 assert(vim.api.nvim_buf_get_lines(0, 0, -1, false)[5] == subject)
 key('q')
 picker:focus('preview')
-key('l')
+key('p')
 diff_loaded(picker)
 assert(selected_commit(picker) == commits[index]:sub(1, 8))
 assert(preview_title(picker) == git({'show', '--no-patch', '--format=%s', 'HEAD'}))
@@ -632,10 +866,10 @@ local picker = open_picker(root)
 history_loaded(picker)
 diff_loaded(picker)
 local text = picker.preview.win:text()
-key('h')
+key('n')
 vim.wait(50)
 assert(selected_commit(picker) == root:sub(1, 8) and picker.preview.win:text() == text)
-key('l')
+key('p')
 diff_loaded(picker)
 assert(selected_commit(picker) ~= root:sub(1, 8))
 close_picker(picker)
@@ -643,15 +877,15 @@ close_picker(picker)
     'working tree remains available after browsing repository commits': r'''
 local picker = open_picker(string.rep('0', 40))
 history_loaded(picker)
-key('h')
+key('n')
 wait_for(function() return selected_commit(picker) end)
 diff_loaded(picker)
 assert(selected_commit(picker))
-key('l')
+key('p')
 diff_loaded(picker)
 assert(history_win(picker):text():find('▶ Working Tree', 1, true))
 local lines = vim.api.nvim_buf_get_lines(history_win(picker).buf, 0, -1, false)
-assert(lines[#lines] == '▶ Working Tree · Not committed yet')
+assert(lines[1] == '▶ Working Tree · Not committed yet')
 assert(preview_title(picker) == 'Working Tree · Not committed yet')
 key('K')
 assert(vim.api.nvim_buf_get_lines(0, 0, -1, false)[2] == 'Not committed yet')
@@ -669,9 +903,9 @@ vim.system = function(command, opts, callback)
     vim.schedule(function() table.insert(releases, function() callback(result) end) end)
   end)
 end
-key('h')
+key('n')
 wait_for(function() return #releases >= 2 end)
-key('l')
+key('p')
 -- Release newer requests first, then all results from the older selection.
 wait_for(function() return #releases >= 4 end)
 for _ = 1, 10 do
@@ -699,10 +933,10 @@ vim.system = function(command, opts, callback)
   end
   return system(command, opts, callback)
 end
-key('h')
+key('n')
 wait_for(function() return release ~= nil end)
 hold_diff = false
-key('l')
+key('p')
 diff_loaded(picker)
 local content = picker.preview.win:text()
 release()
@@ -723,7 +957,7 @@ local picker = open_picker()
 history_loaded(picker)
 assert(picker.list:count() == 0 and not picker.closed)
 empty_files = false
-key('h')
+key('n')
 diff_loaded(picker)
 assert(picker.list:count() > 0)
 close_picker(picker)
@@ -892,7 +1126,7 @@ diff_loaded(picker)
 assert(picker.preview.win:text() ~= '')
 close_picker(picker)
 ''',
-    'root commit shows metadata and Enter focuses its per-file preview': r'''
+    'root commit shows metadata and Ctrl-o focuses its per-file preview': r'''
 local root = git({'rev-list', '--max-parents=0', 'HEAD'}):match('%S+')
 local picker = open_picker(root)
 loaded(picker)
@@ -900,7 +1134,7 @@ assert(preview_title(picker) == git({'show', '--no-patch', '--format=%s', root})
 diff_loaded(picker)
 local count = windows()
 local content = picker.preview.win:text()
-key('<CR>')
+key('<C-O>')
 assert(not picker.closed and picker:current_win() == 'preview')
 assert(windows() == count and picker.preview.win:text() == content)
 close_picker(picker)

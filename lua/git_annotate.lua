@@ -4,6 +4,7 @@ local MAX_DIFF_PREVIEW_BYTES = 2 * 1024 * 1024
 local DIFF_LOADING_DELAY_MS = 3000
 local preview_ns = vim.api.nvim_create_namespace("git_annotate_preview")
 local pending_request
+local log_request = 0
 local hover_requests = {}
 
 --- 解析 git blame --line-porcelain 输出
@@ -543,7 +544,7 @@ local function change_paths(item)
 end
 
 --- 生成单文件 diff 命令
---- @param state {working: boolean, sha?: string, root?: boolean, cwd: string}
+--- @param state {working: boolean, sha?: string, root?: boolean, cwd: string, opened_file?: boolean}
 --- @param item table
 --- @return string[], boolean allow_exit_one
 local function file_diff_command(state, item)
@@ -784,6 +785,7 @@ end
 --- @return table
 local function change_picker_opts(state, ann_win, main_win, source_file)
 	local info_lines, info_process, info_float
+	local filter_float
 	local info_request = 0
 	local files_cancel, active_picker
 	local switch_commit
@@ -793,6 +795,9 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		sha = state.sha,
 		working = state.working,
 		run = collect_bounded,
+		format = function(item)
+			return Snacks.picker.format.git_log(item, active_picker)
+		end,
 		on_select = function(item)
 			if active_picker and not active_picker.closed then
 				switch_commit(active_picker, item)
@@ -947,15 +952,100 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		end)
 	end
 
+	local function filter_commits(picker)
+		if filter_float and filter_float:win_valid() then
+			filter_float:focus()
+			return
+		end
+		local origin = vim.api.nvim_get_current_win()
+		local previous, previous_index = history.filter, history.index
+		local accepted = false
+		filter_float = Snacks.win({
+			text = history.filter,
+			enter = true,
+			width = 0.8,
+			height = 1,
+			row = function()
+				return vim.o.lines - 4
+			end,
+			border = "rounded",
+			title = " Filter commits · Enter: apply · Esc: cancel ",
+			backdrop = false,
+			zindex = picker.layout.root.opts.zindex + 10,
+			bo = { filetype = "gitannotate_filter", modifiable = true, bufhidden = "wipe" },
+			b = { completion = false },
+			keys = {
+				q = false,
+				["<Esc>"] = { "close", mode = { "n", "i" } },
+				["<C-c>"] = { "close", mode = { "n", "i" } },
+				["<CR>"] = {
+					function(win)
+						history:set_filter(win:text())
+						accepted = true
+						win:close()
+					end,
+					mode = { "n", "i" },
+				},
+			},
+			on_close = function()
+				filter_float = nil
+				vim.cmd.stopinsert()
+				if history.closed then
+					return
+				end
+				if not accepted then
+					history:set_filter(previous, previous_index)
+				end
+				vim.schedule(function()
+					if not picker.closed and vim.api.nvim_win_is_valid(origin) then
+						vim.api.nvim_set_current_win(origin)
+					end
+				end)
+			end,
+		})
+		filter_float:on({ "TextChanged", "TextChangedI" }, function(win)
+			history:set_filter(win:text())
+		end, { buf = true })
+		vim.cmd.startinsert({ bang = true })
+	end
+
+	local function open_file(picker, item)
+		if not item or not item.file then
+			return
+		end
+		local path = absolute_path(item.cwd or state.cwd, item.file)
+		local stat = vim.uv.fs_stat(path)
+		if not stat or stat.type ~= "file" then
+			vim.notify("Git annotate: file no longer exists: " .. path, vim.log.levels.WARN)
+			return
+		end
+		if not vim.api.nvim_win_is_valid(main_win) then
+			vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
+			return
+		end
+		local ok, err = pcall(vim.api.nvim_win_call, main_win, function()
+			vim.cmd.edit({ args = { path } })
+		end)
+		if not ok then
+			vim.notify("Git annotate: " .. tostring(err), vim.log.levels.ERROR)
+			return
+		end
+		state.opened_file = true
+		picker:close()
+	end
+
 	local function keys()
 		return {
+			["<CR>"] = { "confirm", mode = { "i", "n" }, desc = "Open file in working tree" },
+			["o"] = { "confirm", mode = "n", desc = "Open file in working tree" },
+			["f"] = { "git_annotate_filter", mode = "n", desc = "Filter commit history" },
 			["<C-o>"] = {
 				"git_annotate_toggle_diff",
 				mode = { "i", "n" },
 				desc = "Toggle files/input and diff preview",
 			},
-			["h"] = { "git_annotate_older", mode = "n", desc = "Show older commit" },
-			["l"] = { "git_annotate_newer", mode = "n", desc = "Show newer commit" },
+			["n"] = { "git_annotate_older", mode = "n", desc = "Show older commit" },
+			["p"] = { "git_annotate_newer", mode = "n", desc = "Show newer commit" },
 			["K"] = { "git_annotate_info", mode = "n", desc = "Show complete commit info" },
 			["O"] = { "git_annotate_browse", mode = "n", desc = "Open commit in browser" },
 		}
@@ -1006,6 +1096,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			preview_file_change(ctx, state)
 		end,
 		actions = {
+			git_annotate_filter = filter_commits,
 			git_annotate_toggle_diff = toggle_diff_focus,
 			git_annotate_older = function()
 				history:move(1)
@@ -1018,7 +1109,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				open_commit_browser(state.working and "" or state.sha, main_win)
 			end,
 		},
-		confirm = "git_annotate_toggle_diff",
+		confirm = open_file,
 		on_show = function(picker)
 			active_picker = picker
 			local revision = state.revision
@@ -1036,6 +1127,9 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		on_close = function()
 			state.revision = state.revision + 1
 			history:close()
+			if filter_float then
+				filter_float:close()
+			end
 			if files_cancel then
 				files_cancel()
 				files_cancel = nil
@@ -1050,8 +1144,9 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				info_float = nil
 			end
 			vim.schedule(function()
-				if vim.api.nvim_win_is_valid(ann_win) then
-					vim.api.nvim_set_current_win(ann_win)
+				local target = state.opened_file and main_win or ann_win
+				if vim.api.nvim_win_is_valid(target) then
+					vim.api.nvim_set_current_win(target)
 				end
 			end)
 		end,
@@ -1068,7 +1163,8 @@ end
 --- @param ann_win integer
 --- @param main_win integer
 --- @param cwd string
-local function open_change_picker(sha, ann_win, main_win, cwd)
+--- @param valid? fun(): boolean
+local function open_change_picker(sha, ann_win, main_win, cwd, valid)
 	if not vim.api.nvim_win_is_valid(ann_win) or not vim.api.nvim_win_is_valid(main_win) then
 		vim.notify("Git annotate: annotate or source window closed", vim.log.levels.WARN)
 		return
@@ -1091,6 +1187,9 @@ local function open_change_picker(sha, ann_win, main_win, cwd)
 	end
 
 	load_commit_files(sha, cwd, function(items, root, err, truncated)
+		if valid and not valid() then
+			return
+		end
 		if not vim.api.nvim_win_is_valid(ann_win) or not vim.api.nvim_win_is_valid(main_win) then
 			return
 		end
@@ -1111,6 +1210,49 @@ local function open_change_picker(sha, ann_win, main_win, cwd)
 		opts.items = items
 		snacks.picker.pick(opts)
 	end)
+end
+
+--- Open repository history at HEAD using the annotate diff picker.
+--- Uses the current file's directory, or cwd for unnamed and special buffers.
+function M.log()
+	local ok, snacks = pcall(require, "snacks")
+	if not ok or not snacks.picker then
+		vim.notify("Git annotate: log requires snacks.nvim", vim.log.levels.WARN)
+		return
+	end
+	local win = vim.api.nvim_get_current_win()
+	local buf = vim.api.nvim_get_current_buf()
+	local filename = vim.api.nvim_buf_get_name(buf)
+	local cwd = vim.bo[buf].buftype == "" and filename ~= "" and vim.fn.fnamemodify(filename, ":h") or vim.fn.getcwd()
+	log_request = log_request + 1
+	local request = log_request
+	local function valid()
+		return request == log_request
+			and vim.api.nvim_win_is_valid(win)
+			and vim.api.nvim_get_current_win() == win
+			and vim.api.nvim_win_get_buf(win) == buf
+			and vim.api.nvim_buf_get_name(buf) == filename
+	end
+
+	vim.system(
+		{ "git", "rev-parse", "--show-toplevel", "--verify", "HEAD" },
+		{ cwd = cwd, text = true },
+		vim.schedule_wrap(function(result)
+			if not valid() then
+				return
+			end
+			if result.code ~= 0 then
+				vim.notify("Git annotate: " .. result.stderr, vim.log.levels.ERROR)
+				return
+			end
+			local root, sha = result.stdout:match("^(.-)\n(%x+)\n?$")
+			if not root or not sha then
+				vim.notify("Git annotate: failed to resolve repository HEAD", vim.log.levels.ERROR)
+				return
+			end
+			open_change_picker(sha, win, win, root, valid)
+		end)
+	)
 end
 
 --- 绑定侧边栏所有快捷键
