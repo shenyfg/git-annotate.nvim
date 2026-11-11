@@ -3,6 +3,7 @@ M.__index = M
 
 local PAGE_SIZE = 200
 local ns = vim.api.nvim_create_namespace("git_annotate_history")
+local selection_ns = vim.api.nvim_create_namespace("git_annotate_history_selection")
 
 --- @param opts {cwd: string, sha?: string, working: boolean, run: function, on_select: function, format: function}
 function M.new(opts)
@@ -85,12 +86,10 @@ function M:render(win)
 		local count = #self.visible .. (self.more and "+ matches" or " matches")
 		lines[1] = { { "Filter: " .. self.filter .. " · " .. count, "DiagnosticInfo" } }
 	end
-	local selected_row
+	self.rows = {}
 	for _, index in ipairs(self.visible) do
 		local item = self.items[index]
-		if index == self.index then
-			selected_row = #lines + 1
-		end
+		self.rows[index] = #lines + 1
 		local line = { { self:is_origin(item) and "▶ " or "  ", "DiagnosticInfo" } }
 		local content = item.working and { { item.subject, "SnacksPickerGitMsg" } } or self.opts.format(item)
 		Snacks.picker.highlight.extend(line, content)
@@ -105,8 +104,19 @@ function M:render(win)
 		lines[#lines + 1] = { { message or "No commits", "Comment" } }
 	end
 	Snacks.picker.highlight.render(win.buf, ns, lines)
+	self:show_selection()
+end
+
+--- Move only the selection mark while browsing already rendered history.
+function M:show_selection()
+	local win = self.win
+	if not win or not win:buf_valid() then
+		return
+	end
+	vim.api.nvim_buf_clear_namespace(win.buf, selection_ns, 0, -1)
+	local selected_row = self.rows and self.rows[self.index]
 	if selected_row and win:win_valid() then
-		vim.api.nvim_buf_set_extmark(win.buf, ns, selected_row - 1, 0, { line_hl_group = "Visual" })
+		vim.api.nvim_buf_set_extmark(win.buf, selection_ns, selected_row - 1, 0, { line_hl_group = "Visual" })
 		vim.api.nvim_win_set_cursor(win.win, { selected_row, 0 })
 		vim.api.nvim_win_call(win.win, function()
 			vim.cmd("normal! zz")
@@ -238,7 +248,7 @@ function M:move(delta)
 		return
 	end
 	self.index = index
-	self:render()
+	self:show_selection()
 	self.opts.on_select(self.items[index])
 end
 

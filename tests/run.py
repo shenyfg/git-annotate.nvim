@@ -493,7 +493,8 @@ local function history_loaded(picker)
 end
 local function diff_loaded(picker)
   wait_for(function() return not picker:is_active() and picker.preview.win:buf_valid() and
-    picker.preview.win:text() ~= '' and not picker.preview.win:text():match('^Loading') end)
+    picker.preview.win:text() ~= '' and not picker.preview.win:text():match('^Loading') and
+    not vim.b[picker.preview.win.buf].git_annotate_rendering end)
 end
 local function open_picker(sha)
   sha = sha or git({'rev-parse', 'HEAD'})
@@ -547,6 +548,321 @@ end
 '''
 
 SNACKS_CASES = {
+    'j k n and p move immediately while the real preview worker is busy': r'''
+local renderer = require('git_annotate.preview')
+local new, session = renderer.new
+renderer.new = function(...)
+  session = new(...)
+  return session
+end
+local picker = open_picker(git({'log', '-1', '--format=%H', '--', 'README_ZH.md'}))
+history_loaded(picker)
+diff_loaded(picker)
+vim.rpcnotify(session.channel, 'nvim_exec_lua', [[
+  local renderer = require('git_annotate.preview')
+  local format = renderer._format
+  renderer._format = function(...)
+    vim.rpcnotify(1, 'nvim_exec_lua', '_G.worker_busy = true', {})
+    vim.uv.sleep(200)
+    return format(...)
+  end
+]], {})
+picker.preview:show(picker, {force = true})
+wait_for(function() return _G.worker_busy end)
+local original, commit = picker:current(), selected_commit(picker)
+local start = vim.uv.hrtime()
+key('j')
+assert(picker:current() ~= original)
+key('k')
+assert(picker:current() == original)
+assert((vim.uv.hrtime() - start) / 1e6 < 100, 'j/k waited for formatting')
+local history_buf = history_win(picker).buf
+local changed = vim.api.nvim_buf_get_changedtick(history_buf)
+key('n')
+assert(selected_commit(picker) ~= commit)
+key('p')
+assert(selected_commit(picker) == commit)
+assert(vim.api.nvim_buf_get_changedtick(history_buf) == changed, 'n/p rewrote history text')
+diff_loaded(picker)
+close_picker(picker)
+''',
+    'a busy formatter never blocks input and skips superseded queued previews': r'''
+local picker = direct_log()
+diff_loaded(picker)
+local renderer = require('git_annotate.preview')
+local session = renderer.new()
+-- Delay the real formatter in the child, not the UI event loop.
+vim.rpcnotify(session.channel, 'nvim_exec_lua', [[
+  local renderer = require('git_annotate.preview')
+  local format, calls = renderer._format, 0
+  renderer._format = function(...)
+    calls = calls + 1
+    vim.uv.sleep(200)
+    format(...)
+    vim.rpcnotify(1, 'nvim_exec_lua', '_G.worker_formats = ...', {calls})
+  end
+]], {})
+local ctx = {picker = picker, preview = picker.preview, item = picker:current(), win = picker.preview.win.win}
+local header = {'diff --git a/sample.lua b/sample.lua', '--- a/sample.lua', '+++ b/sample.lua', '@@ -1 +1 @@', '-old'}
+local finished, selected = {}, 1
+local function queue(index)
+  selected = index
+  local lines = vim.deepcopy(header)
+  lines[#lines + 1] = '+local latest = ' .. index
+  renderer.render(session, ctx, lines, function() return selected == index end, function(err)
+    assert(not err, err)
+    finished[#finished + 1] = index
+  end)
+end
+queue(1)
+queue(2)
+queue(3)
+local input_ran = false
+vim.defer_fn(function()
+  picker.list:move(0)
+  input_ran = true
+end, 10)
+assert(vim.wait(100, function() return input_ran end, 1), 'formatter blocked the UI')
+assert(#finished == 0, 'the test worker should still be busy')
+wait_for(function() return #finished == 1 and _G.worker_formats == 2 end)
+assert(finished[1] == 3 and picker.preview.win:text():find('latest = 3', 1, true))
+local channel = session.channel
+renderer.close(session)
+wait_for(function() return vim.fn.jobwait({channel}, 0)[1] ~= -1 end)
+picker:close()
+''',
+    'canceling a partially applied preview prevents further writes and closes the worker': r'''
+local picker = direct_log()
+diff_loaded(picker)
+local renderer = require('git_annotate.preview')
+local session = renderer.new()
+local ctx = {picker = picker, preview = picker.preview, item = picker:current(), win = picker.preview.win.win}
+local lines = {'diff --git a/sample.lua b/sample.lua', '--- a/sample.lua', '+++ b/sample.lua', '@@ -1 +1,5000 @@', '-old'}
+for i = 1, 5000 do lines[#lines + 1] = '+local value = ' .. i end
+local apply, interrupted, ticks, finished = renderer._apply, false, 0, false
+renderer._apply = function(s, request)
+  apply(s, request)
+  if s == session and request.buf and vim.b[request.buf].git_annotate_rendering then
+    ticks = ticks + 1
+    assert(vim.api.nvim_buf_line_count(request.buf) < #lines, 'entire diff applied in one UI slice')
+    renderer.cancel(session)
+    interrupted = request.buf
+  end
+end
+renderer.render(session, ctx, lines, function() return true end, function() finished = true end)
+wait_for(function() return interrupted end)
+local changed = vim.api.nvim_buf_get_changedtick(interrupted)
+renderer.close(session)
+vim.wait(100)
+assert(ticks == 1 and not finished)
+assert(vim.api.nvim_buf_get_changedtick(interrupted) == changed)
+assert(vim.fn.jobwait({session.channel}, 0)[1] ~= -1)
+renderer._apply = apply
+picker:close()
+''',
+    'a failed formatter reports the error and the next preview starts a fresh worker': r'''
+local renderer = require('git_annotate.preview')
+local new, session = renderer.new
+renderer.new = function(...)
+  session = new(...)
+  return session
+end
+local picker = direct_log()
+diff_loaded(picker)
+local channel = session.channel
+vim.rpcnotify(channel, 'nvim_exec_lua', [[
+  require('git_annotate.preview')._format = function() vim.cmd('cq') end
+]], {})
+picker.preview:show(picker, {force = true})
+wait_for(function() return picker.preview.win:text():find('Diff formatter exited:', 1, true) end)
+assert(session.closed)
+picker.preview:show(picker, {force = true})
+diff_loaded(picker)
+assert(not session.closed and session.channel ~= channel)
+assert(not picker.preview.win:text():match('^Git annotate:'))
+picker:close()
+''',
+    'a formatter transport failure is reported and can recover on the next selection': r'''
+local picker = direct_log()
+diff_loaded(picker)
+local notify = vim.rpcnotify
+vim.rpcnotify = function(channel, method, code, args)
+  if code:find('._format', 1, true) then error('test closed formatter channel') end
+  return notify(channel, method, code, args)
+end
+picker.preview:show(picker, {force = true})
+wait_for(function() return picker.preview.win:text():find('test closed formatter channel', 1, true) end)
+vim.rpcnotify = notify
+picker.preview:show(picker, {force = true})
+diff_loaded(picker)
+assert(not picker.preview.win:text():match('^Git annotate:'))
+picker:close()
+''',
+    'rapid commit navigation loads only the final selection and closing cancels the delay': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local system, calls = vim.system, {}
+vim.system = function(command, opts, callback)
+  if callback then calls[#calls + 1] = vim.deepcopy(command) end
+  return system(command, opts, callback)
+end
+key('n')
+local target = selected_commit(picker)
+key('n')
+key('p')
+assert(selected_commit(picker) == target, 'history selection must move immediately')
+assert(#calls == 0, 'intermediate selections started Git processes')
+assert(picker:current() == nil, 'old files remain actionable during the delay')
+diff_loaded(picker)
+local metadata, diffs = 0, 0
+for _, command in ipairs(calls) do
+  if command[2] == 'show' then metadata = metadata + 1 end
+  if vim.tbl_contains(command, '--no-ext-diff') then diffs = diffs + 1 end
+end
+assert(metadata == 1 and diffs == 1, vim.inspect(calls))
+assert(preview_title(picker) == git({'show', '--no-patch', '--format=%s', target}))
+calls = {}
+key('n')
+picker:close()
+vim.wait(200)
+assert(#calls == 0 and #Snacks.picker.get() == 0 and windows() == 1)
+''',
+    'filter input coalesces changes, Enter flushes immediately and Esc cancels pending text': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local head = selected_commit(picker)
+local target = git({'rev-parse', '--short=8', 'HEAD~1'})
+local History = require('git_annotate.history')
+local original, applied = History.set_filter, {}
+History.set_filter = function(self, query, ...)
+  applied[#applied + 1] = query
+  return original(self, query, ...)
+end
+key('f')
+filter_text(target:sub(1, 2))
+filter_text(target:sub(1, 4))
+filter_text(target)
+assert(#applied == 0 and selected_commit(picker) == head)
+wait_for(function() return selected_commit(picker) == target end)
+assert(#applied == 1 and applied[1] == target)
+assert(vim.bo.filetype == 'gitannotate_filter', 'preview update stole filter focus')
+-- Confirm the latest text without waiting for its timer.
+filter_text(head)
+key('<CR>')
+assert(selected_commit(picker) == head)
+vim.wait(150)
+assert(#applied == 2, 'a canceled input timer applied the query again')
+key('f')
+filter_text(target)
+key('<Esc>')
+vim.wait(150)
+assert(selected_commit(picker) == head and #applied == 3)
+key('f')
+filter_text(target)
+picker:close()
+vim.wait(150)
+assert(#applied == 3 and windows() == 1)
+''',
+    'switching commits and closing the picker terminate in-flight diff processes': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local system, started, killed, exited = vim.system, 0, 0, 0
+vim.system = function(command, opts, callback)
+  if vim.tbl_contains(command, '--no-ext-diff') then
+    started = started + 1
+    local process = system({'sleep', '10'}, opts, function(result)
+      exited = exited + 1
+      callback(result)
+    end)
+    local kill = process.kill
+    process.kill = function(self, signal)
+      killed = killed + 1
+      return kill(self, signal)
+    end
+    return process
+  end
+  return system(command, opts, callback)
+end
+picker.preview:show(picker, {force = true})
+assert(started == 1)
+key('n')
+assert(killed == 1)
+wait_for(function() return started == 2 end)
+picker:close()
+wait_for(function() return exited == 2 and windows() == 1 end)
+assert(killed == 2 and #Snacks.picker.get() == 0)
+''',
+    'background previews preserve Snacks text, highlights and metadata for ordinary large diffs': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local D = require('snacks.picker.util.diff')
+local header = 'diff --git a/sample.lua b/sample.lua\n--- a/sample.lua\n+++ b/sample.lua\n'
+local small = header .. '@@ -1 +1 @@\n-old\n+new\n'
+local many = header .. '@@ -1 +1,1200 @@\n-old\n' .. string.rep('+local value = 1\n', 1200)
+local fragmented = header
+for i = 1, 30 do fragmented = fragmented .. '@@ -' .. i .. ' +' .. i .. ' @@\n-old\n+new\n' end
+local long = header .. '@@ -1 +1 @@\n-old\n+' .. string.rep('x', 1100) .. '\n'
+local bytes = header .. '@@ -1 +1,100 @@\n-old\n' .. string.rep('+' .. string.rep('x', 130) .. '\n', 100)
+local system, output = vim.system, small
+vim.system = function(command, opts, callback)
+  if vim.tbl_contains(command, '--no-ext-diff') then
+    return system({'cat'}, vim.tbl_extend('force', opts, {stdin = output}), callback)
+  end
+  return system(command, opts, callback)
+end
+local expected_buf = vim.api.nvim_create_buf(false, true)
+local expected_ns = vim.api.nvim_create_namespace('expected_diff')
+local actual_ns = vim.api.nvim_get_namespaces().git_annotate_preview
+local function marks(buf, ns)
+  return vim.tbl_map(function(mark)
+    mark[4].ns_id = nil
+    return {mark[2], mark[3], mark[4]}
+  end,
+    vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {details = true}))
+end
+for _, patch in ipairs({small, many, small, fragmented, long, bytes}) do
+  output = patch
+  local lines = vim.split(vim.trim(patch), '\n', {plain = true})
+  D.render(expected_buf, expected_ns, lines)
+  -- Any call to the synchronous formatter in the UI process is a regression.
+  local format = D.format
+  D.format = function() error('UI thread formatted a diff') end
+  picker.preview:show(picker, {force = true})
+  diff_loaded(picker)
+  D.format = format
+  local actual = picker.preview.win.buf
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(actual, 0, -1, false),
+    vim.api.nvim_buf_get_lines(expected_buf, 0, -1, false)))
+  assert(vim.deep_equal(marks(actual, actual_ns), marks(expected_buf, expected_ns)), 'fancy highlights changed')
+  assert(vim.deep_equal(vim.b[actual].snacks_meta, vim.b[expected_buf].snacks_meta), 'diff metadata changed')
+end
+picker:close()
+vim.api.nvim_buf_delete(expected_buf, {force = true})
+''',
+    'only truncated oversized diffs use the plain preview safety path': r'''
+local picker = direct_log()
+diff_loaded(picker)
+local system = vim.system
+local output = 'diff --git a/large.lua b/large.lua\n--- a/large.lua\n+++ b/large.lua\n'
+  .. '@@ -1 +1,450000 @@\n-old\n' .. string.rep('+new\n', 450000)
+vim.system = function(command, opts, callback)
+  if vim.tbl_contains(command, '--no-ext-diff') then
+    return system({'cat'}, vim.tbl_extend('force', opts, {stdin = output}), callback)
+  end
+  return system(command, opts, callback)
+end
+picker.preview:show(picker, {force = true})
+diff_loaded(picker)
+assert(preview_title(picker):find('[truncated]', 1, true))
+assert(picker.preview.win:text():find('diff preview truncated at 2 MiB.', 1, true))
+assert(#vim.api.nvim_buf_get_extmarks(picker.preview.win.buf,
+  vim.api.nvim_get_namespaces().git_annotate_preview, 0, -1, {}) == 0)
+picker:close()
+''',
     'log hides tests by default and Ctrl-t toggles across panes, commits and empty results': r'''
 local picker = direct_log()
 history_loaded(picker)
@@ -583,9 +899,10 @@ key('<C-T>')
 local head = selected_commit(picker)
 key('n')
 wait_for(function() return selected_commit(picker) ~= head end)
-check_files('HEAD~1', true)
+local older = selected_commit(picker)
+check_files(older, true)
 key('<C-T>')
-check_files('HEAD~1', false)
+check_files(older, false)
 key('p')
 wait_for(function() return selected_commit(picker) == head end)
 check_files('HEAD', false)
@@ -650,7 +967,7 @@ diff_loaded(picker)
 local text, title = picker.preview.win:text(), preview_title(picker)
 key('f')
 filter_text('definitely-no-such-commit-[%]')
-assert(history_win(picker):text():find('No matching commits', 1, true))
+wait_for(function() return history_win(picker):text():find('No matching commits', 1, true) end)
 assert(picker.preview.win:text() == text and preview_title(picker) == title)
 local filter_buf = vim.api.nvim_get_current_buf()
 picker:close()
@@ -706,21 +1023,17 @@ end
 ''',
     'detail Enter and o open the selected working tree file at its first change': r'''
 vim.cmd.cd('/tmp')
-local patch = git({'diff', '--unified=0', 'HEAD^', 'HEAD', '--', 'README_ZH.md'})
-local expected = tonumber(patch:match('@@ %-%d+,?%d* %+(%d+)'))
-assert(expected and expected > 1)
 for _, entry in ipairs({{'list', '<CR>'}, {'preview', 'o'}}) do
   vim.cmd.edit(REPO .. '/README.md')
   local picker = direct_log()
   diff_loaded(picker)
-  for index, item in ipairs(picker:items()) do
-    if item.file == 'README_ZH.md' then picker.list:view(index) end
-  end
-  assert(picker:current().file == 'README_ZH.md')
+  local file = picker:current().file
+  local patch = git({'diff', '--unified=0', 'HEAD^', 'HEAD', '--', file})
+  local expected = assert(tonumber(patch:match('@@ %-%d+,?%d* %+(%d+)')))
   picker:focus(entry[1])
   key(entry[2])
   wait_for(function() return windows() == 1 end)
-  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/README_ZH.md')
+  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/' .. file)
   assert(vim.api.nvim_win_get_cursor(0)[1] == expected)
   assert(#Snacks.picker.get() == 0)
 end
@@ -731,7 +1044,7 @@ local cases = {
   {header .. '@@ -6,4 +6,4 @@\n context\n context\n-old\n+new\n context\n', 8},
   {header .. '@@ -6,3 +6,2 @@\n context\n-deleted\n context\n', 7},
   {header .. '@@ -6 +5,0 @@\n-deleted\n', 6},
-  {header .. '@@ -999 +999 @@\n-old\n+new\n', 'last'},
+  {header .. '@@ -999999 +999999 @@\n-old\n+new\n', 'last'},
   {'diff --git a/old.md b/README_ZH.md\nsimilarity index 100%\nrename from old.md\nrename to README_ZH.md\n'},
   {'diff --git a/README_ZH.md b/README_ZH.md\nBinary files differ\n'},
   {nil}, -- A failed diff query must still open the file.
@@ -740,9 +1053,7 @@ for _, case in ipairs(cases) do
   vim.cmd.edit(REPO .. '/README.md')
   local picker = direct_log()
   diff_loaded(picker)
-  for index, item in ipairs(picker:items()) do
-    if item.file == 'README_ZH.md' then picker.list:view(index) end
-  end
+  local file = picker:current().file
   local system = vim.system
   vim.system = function(command, opts, callback)
     if vim.tbl_contains(command, 'diff') then
@@ -753,7 +1064,7 @@ for _, case in ipairs(cases) do
   key('<CR>')
   wait_for(function() return windows() == 1 end)
   vim.system = system
-  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/README_ZH.md')
+  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/' .. file)
   local expected = case[2] == 'last' and vim.api.nvim_buf_line_count(0) or case[2]
   if expected then assert(vim.api.nvim_win_get_cursor(0)[1] == expected) end
 end
@@ -866,7 +1177,7 @@ assert(urls[4] == 'https://github.com/example/project/commit/' .. git({'rev-pars
 close_picker(picker)
 ''',
     'diff loading waits three seconds and ignores completed, superseded and closed previews': r'''
-local picker = open_picker()
+local picker = open_picker(git({'log', '-1', '--format=%H', '--', 'README_ZH.md'}))
 history_loaded(picker)
 diff_loaded(picker)
 local system, defer = vim.system, vim.defer_fn
@@ -952,7 +1263,7 @@ history_loaded(picker)
 assert(selected_commit(picker) == sha:sub(1, 8))
 local win = history_win(picker)
 local row = vim.api.nvim_win_get_cursor(win.win)[1]
-local marks = vim.api.nvim_buf_get_extmarks(win.buf, vim.api.nvim_get_namespaces().git_annotate_history,
+local marks = vim.api.nvim_buf_get_extmarks(win.buf, -1,
   {row - 1, 0}, {row - 1, -1}, {details = true})
 local groups, selected = {}, false
 for _, mark in ipairs(marks) do
@@ -1006,7 +1317,7 @@ assert(selected_commit(picker) == older:sub(1, 8))
 assert(history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', commits[index]}), 1, true))
 assert(not history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', older}), 1, true))
 assert(preview_title(picker) == subject)
-local expected = vim.split(git({'diff-tree', '--no-commit-id', '--name-only', '-r', older}), '\n')
+local expected = vim.split(git({'diff', '--name-only', older .. '^', older}), '\n')
 expected = vim.tbl_filter(function(file)
   return not ('/' .. file .. '/'):find('/tests/', 1, true)
 end, expected)

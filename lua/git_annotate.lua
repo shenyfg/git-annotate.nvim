@@ -2,7 +2,8 @@ local M = {}
 
 local MAX_DIFF_PREVIEW_BYTES = 2 * 1024 * 1024
 local DIFF_LOADING_DELAY_MS = 3000
-local preview_ns = vim.api.nvim_create_namespace("git_annotate_preview")
+local DETAIL_DELAY_MS = 40
+local FILTER_DELAY_MS = 100
 local pending_request
 local log_request = 0
 local hover_requests = {}
@@ -509,24 +510,44 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 	end)
 end
 
---- 使用 Snacks 与 git status 相同的 diff 风格渲染已收集的内容
---- @param ctx snacks.picker.preview.ctx
---- @param lines string[]
-local function render_commit_preview(ctx, lines)
-	local style = ctx.picker.opts.previewers.diff.style
-	if style == "fancy" then
-		local buf = ctx.preview:scratch()
-		ctx.preview.win:map()
-		require("snacks.picker.util.diff").render(buf, preview_ns, lines, {
-			annotations = ctx.item.annotations or ctx.picker.opts.annotations,
-		})
-		Snacks.util.wo(ctx.win, ctx.picker.opts.previewers.diff.wo or {})
+--- Format fancy diffs off the UI thread; retain the original oversized-output guard.
+local function render_commit_preview(ctx, state, lines, truncated, valid, finish)
+	if ctx.picker.opts.previewers.diff.style == "fancy" and not truncated then
+		local renderer = require("git_annotate.preview")
+		if not state.renderer or state.renderer.closed then
+			local ok, session = pcall(renderer.new)
+			if not ok then
+				finish(tostring(session))
+				return
+			end
+			state.renderer = session
+		end
+		renderer.render(state.renderer, ctx, lines, valid, finish)
 		return
 	end
-
 	ctx.preview:reset()
 	ctx.preview:set_lines(lines)
 	ctx.preview:highlight({ ft = "git" })
+	finish()
+end
+
+--- Cancel an obsolete diff before starting another request or closing its picker.
+local function cancel_preview(state)
+	state.preview_request = nil
+	if state.renderer then
+		require("git_annotate.preview").cancel(state.renderer)
+	end
+	if state.preview_process then
+		pcall(state.preview_process.kill, state.preview_process, 15)
+		state.preview_process = nil
+	end
+end
+
+local function cancel_timer(timer)
+	if timer and not timer:is_closing() then
+		timer:stop()
+		timer:close()
+	end
 end
 
 --- 获取文件变更的路径（rename/copy 同时包含旧新路径）
@@ -607,6 +628,7 @@ end
 --- @param ctx snacks.picker.preview.ctx
 --- @param state {working: boolean, sha?: string, root?: boolean, cwd: string}
 local function preview_file_change(ctx, state)
+	cancel_preview(state)
 	local request = {}
 	state.preview_request = request
 	if state.loading then
@@ -630,13 +652,14 @@ local function preview_file_change(ctx, state)
 			and state.revision == revision
 			and state.preview_request == request
 			and ctx.preview.item == ctx.item
+			and ctx.picker:current() == ctx.item
 			and ctx.preview.win:buf_valid()
 	end
 
 	-- 快速切换时不显示加载提示；过期或已完成的请求不能覆盖当前预览。
 	local completed = false
 	vim.defer_fn(function()
-		if not completed and preview_is_valid() then
+		if not completed and preview_is_valid() and not vim.b[ctx.preview.win.buf].git_annotate_rendering then
 			ctx.preview:set_lines({ "Loading diff…" })
 		end
 	end, DIFF_LOADING_DELAY_MS)
@@ -651,20 +674,37 @@ local function preview_file_change(ctx, state)
 	end
 
 	local command, allow_exit_one = file_diff_command(state, ctx.item)
-	collect_bounded(command, function(result)
-		completed = true
+	state.preview_process = collect_bounded(command, function(result)
 		if not preview_is_valid() then
 			return
 		end
+		state.preview_process = nil
 		if not diff_succeeded(result, allow_exit_one) then
+			completed = true
 			show_error(result.stderr ~= "" and result.stderr or "git diff failed")
 			return
 		end
 
-		render_commit_preview(ctx, diff_lines(result.stdout, result.truncated))
-		state.preview_truncated = result.truncated
-		ctx.preview:set_title(commit_preview_title(state))
-		ctx.picker:update_titles()
+		render_commit_preview(
+			ctx,
+			state,
+			diff_lines(result.stdout, result.truncated),
+			result.truncated,
+			preview_is_valid,
+			function(err)
+				completed = true
+				if not preview_is_valid() then
+					return
+				end
+				if err then
+					show_error(err)
+					return
+				end
+				state.preview_truncated = result.truncated
+				ctx.preview:set_title(commit_preview_title(state))
+				ctx.picker:update_titles()
+			end
+		)
 	end, state.cwd)
 end
 
@@ -810,6 +850,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 	local filter_float
 	local info_request = 0
 	local files_cancel, active_picker
+	local switch_timer
 	local switch_commit
 	state.revision = 0
 	local history = require("git_annotate.history").new({
@@ -822,7 +863,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		end,
 		on_select = function(item)
 			if active_picker and not active_picker.closed then
-				switch_commit(active_picker, item)
+				switch_commit(active_picker, item, filter_float ~= nil)
 			end
 		end,
 	})
@@ -868,7 +909,10 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		end)
 	end
 
-	switch_commit = function(picker, item)
+	switch_commit = function(picker, item, immediate)
+		cancel_timer(switch_timer)
+		switch_timer = nil
+		cancel_preview(state)
 		state.revision = state.revision + 1
 		local revision = state.revision
 		local function valid()
@@ -878,6 +922,11 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			files_cancel()
 			files_cancel = nil
 		end
+		info_request = info_request + 1
+		if info_process then
+			pcall(info_process.kill, info_process, 15)
+			info_process = nil
+		end
 		state.sha, state.working, state.root = item.sha, item.working == true, nil
 		state.subject, state.preview_truncated = item.subject, false
 		state.items, state.loading = {}, not state.working
@@ -885,7 +934,12 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		picker.title = state.working and "Working Tree Changes" or "Loading commit info…"
 		picker.preview.item = nil
 		picker.preview:reset()
+		picker.preview:set_title(commit_preview_title(state))
+		picker.preview:set_lines({ "Loading changed files…" })
+		set_info_lines(info_float, { "Loading commit info…" })
 		picker.input:set("", "")
+		picker.finder:abort()
+		picker.matcher:abort()
 		picker.list:set_selected()
 		picker.list:clear()
 		local function refresh(message)
@@ -907,22 +961,33 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				end,
 			})
 		end
-		refresh(state.loading and "Loading changed files…" or nil)
-		load_info(picker)
-		if state.working then
-			return
-		end
-		files_cancel = load_commit_files(state.sha, state.cwd, function(items, root, err, truncated)
+		local function load_details()
+			switch_timer = nil
 			if not valid() then
 				return
 			end
-			files_cancel = nil
-			state.loading, state.root, state.items = false, root, items or {}
-			if truncated then
-				vim.notify("Git annotate: changed file list truncated at 2 MiB", vim.log.levels.WARN)
+			load_info(picker)
+			if state.working then
+				refresh()
+				return
 			end
-			refresh(err and "Git annotate: " .. err or nil)
-		end)
+			files_cancel = load_commit_files(state.sha, state.cwd, function(items, root, err, truncated)
+				if not valid() then
+					return
+				end
+				files_cancel = nil
+				state.loading, state.root, state.items = false, root, items or {}
+				if truncated then
+					vim.notify("Git annotate: changed file list truncated at 2 MiB", vim.log.levels.WARN)
+				end
+				refresh(err and "Git annotate: " .. err or nil)
+			end)
+		end
+		if immediate then
+			load_details()
+		else
+			switch_timer = vim.defer_fn(load_details, DETAIL_DELAY_MS)
+		end
 	end
 
 	local function show_info(picker)
@@ -982,6 +1047,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		local origin = vim.api.nvim_get_current_win()
 		local previous, previous_index = history.filter, history.index
 		local accepted = false
+		local filter_timer
 		filter_float = Snacks.win({
 			text = history.filter,
 			enter = true,
@@ -1010,6 +1076,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				},
 			},
 			on_close = function()
+				cancel_timer(filter_timer)
 				filter_float = nil
 				vim.cmd.stopinsert()
 				if history.closed then
@@ -1019,14 +1086,20 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 					history:set_filter(previous, previous_index)
 				end
 				vim.schedule(function()
-					if not picker.closed and vim.api.nvim_win_is_valid(origin) then
+					if not picker.closed and not filter_float and vim.api.nvim_win_is_valid(origin) then
 						vim.api.nvim_set_current_win(origin)
 					end
 				end)
 			end,
 		})
 		filter_float:on({ "TextChanged", "TextChangedI" }, function(win)
-			history:set_filter(win:text())
+			cancel_timer(filter_timer)
+			filter_timer = vim.defer_fn(function()
+				filter_timer = nil
+				if not picker.closed and filter_float == win and win:win_valid() then
+					history:set_filter(win:text())
+				end
+			end, FILTER_DELAY_MS)
 		end, { buf = true })
 		vim.cmd.startinsert({ bang = true })
 	end
@@ -1181,7 +1254,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				return state.revision == revision
 			end)
 			if state.loading then
-				switch_commit(picker, { sha = state.sha, working = state.working, subject = state.subject })
+				switch_commit(picker, { sha = state.sha, working = state.working, subject = state.subject }, true)
 			else
 				load_info(picker)
 			end
@@ -1189,6 +1262,11 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			history:load()
 		end,
 		on_close = function()
+			cancel_timer(switch_timer)
+			cancel_preview(state)
+			if state.renderer then
+				require("git_annotate.preview").close(state.renderer)
+			end
 			state.revision = state.revision + 1
 			history:close()
 			if filter_float then
