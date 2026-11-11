@@ -54,6 +54,57 @@ local function hold_exits()
 end
 '''
 CASES = {
+    'switching between annotate and source synchronizes rows and preserves target columns': r'''
+vim.cmd.enew()
+local lines, annotations = {}, {}
+for i = 1, 30 do
+  lines[i] = 'source line with enough columns'
+  annotations[i] = {sha = string.rep('a', 40), text = 'Author annotation', author_time = 0}
+end
+vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+local other = vim.api.nvim_get_current_win()
+vim.cmd.vsplit()
+local main = vim.api.nvim_get_current_win()
+local source_buf = vim.api.nvim_get_current_buf()
+vim.api.nvim_win_set_cursor(main, {2, 7})
+M._open_sidebar(annotations, source_buf, main, 1, 2, REPO)
+local sidebar = vim.api.nvim_get_current_win()
+vim.api.nvim_win_set_cursor(sidebar, {12, 3})
+vim.cmd.wincmd('p')
+assert(vim.api.nvim_get_current_win() == main)
+assert(vim.deep_equal(vim.api.nvim_win_get_cursor(main), {12, 7}))
+vim.api.nvim_win_set_cursor(main, {21, 9})
+vim.cmd.wincmd('p')
+assert(vim.api.nvim_get_current_win() == sidebar)
+assert(vim.deep_equal(vim.api.nvim_win_get_cursor(sidebar), {21, 3}))
+-- An unrelated window showing the same buffer must not participate.
+vim.api.nvim_set_current_win(other)
+vim.api.nvim_win_set_cursor(other, {5, 1})
+vim.api.nvim_set_current_win(sidebar)
+assert(vim.api.nvim_win_get_cursor(sidebar)[1] == 21)
+assert(vim.api.nvim_win_get_cursor(main)[1] == 21)
+-- Floating windows must not move either paired cursor when returning.
+local float_buf = vim.api.nvim_create_buf(false, true)
+local float = vim.api.nvim_open_win(float_buf, true, {
+  relative = 'editor', row = 1, col = 1, width = 20, height = 3, style = 'minimal',
+})
+vim.api.nvim_win_close(float, true)
+vim.api.nvim_set_current_win(sidebar)
+assert(vim.api.nvim_win_get_cursor(sidebar)[1] == 21)
+assert(vim.api.nvim_win_get_cursor(main)[1] == 21)
+-- Edits can make either side shorter than the row being transferred.
+vim.api.nvim_buf_set_lines(source_buf, 5, -1, false, {})
+vim.api.nvim_set_current_win(main)
+assert(vim.api.nvim_win_get_cursor(main)[1] == 5)
+vim.api.nvim_buf_set_lines(source_buf, 5, -1, false, lines)
+vim.api.nvim_win_set_cursor(main, {35, 9})
+vim.api.nvim_set_current_win(sidebar)
+assert(vim.api.nvim_win_get_cursor(sidebar)[1] == 30)
+key('q')
+for _, autocmd in ipairs(vim.api.nvim_get_autocmds({})) do
+  assert(not (autocmd.group_name or ''):match('^GitAnnotateSync'))
+end
+''',
     'commit navigation visits only first occurrences and synchronizes both windows': r'''
 local main = vim.api.nvim_get_current_win()
 local annotations = {}
@@ -442,7 +493,7 @@ local function history_loaded(picker)
 end
 local function diff_loaded(picker)
   wait_for(function() return not picker:is_active() and picker.preview.win:buf_valid() and
-    picker.preview.win:text() ~= '' and not picker.preview.win:text():find('Loading', 1, true) end)
+    picker.preview.win:text() ~= '' and not picker.preview.win:text():match('^Loading') end)
 end
 local function open_picker(sha)
   sha = sha or git({'rev-parse', 'HEAD'})
@@ -496,6 +547,66 @@ end
 '''
 
 SNACKS_CASES = {
+    'log hides tests by default and Ctrl-t toggles across panes, commits and empty results': r'''
+local picker = direct_log()
+history_loaded(picker)
+diff_loaded(picker)
+local function check_files(ref, show_tests)
+  local expected = vim.split(git({'diff', '--name-only', ref .. '^', ref}), '\n')
+  if not show_tests then
+    expected = vim.tbl_filter(function(file)
+      return not ('/' .. file .. '/'):find('/tests/', 1, true)
+    end, expected)
+  end
+  table.sort(expected)
+  wait_for(function()
+    if picker:is_active() then return false end
+    local actual = vim.tbl_map(function(item) return item.file end, picker:items())
+    table.sort(actual)
+    return vim.deep_equal(actual, expected)
+  end)
+end
+check_files('HEAD', false)
+for _, pane in ipairs({'list', 'input', 'preview'}) do
+  picker:focus(pane)
+  vim.cmd.stopinsert()
+  key('<C-T>')
+  check_files('HEAD', true)
+  key('<C-T>')
+  check_files('HEAD', false)
+end
+-- The input mapping also supports insert mode.
+assert(vim.api.nvim_buf_call(picker.input.win.buf, function()
+  return vim.fn.maparg('<C-t>', 'i', false, true).callback
+end))
+key('<C-T>')
+local head = selected_commit(picker)
+key('n')
+wait_for(function() return selected_commit(picker) ~= head end)
+check_files('HEAD~1', true)
+key('<C-T>')
+check_files('HEAD~1', false)
+key('p')
+wait_for(function() return selected_commit(picker) == head end)
+check_files('HEAD', false)
+-- A search matching only hidden tests can recover without clearing the query.
+picker.input:set('tests/run.py', '')
+picker:find()
+wait_for(function() return not picker:is_active() and #picker:items() == 0 end)
+key('<C-T>')
+wait_for(function()
+  return not picker:is_active() and #picker:items() == 1 and picker:current().file == 'tests/run.py'
+end)
+diff_loaded(picker)
+key('<C-T>')
+wait_for(function() return not picker:is_active() and #picker:items() == 0 end)
+picker:close()
+wait_for(function() return windows() == 1 end)
+picker = direct_log()
+diff_loaded(picker)
+check_files('HEAD', false)
+picker:close()
+''',
     'f filters in place, Enter keeps it, Esc restores it, and clearing shows all commits': r'''
 local picker = direct_log()
 history_loaded(picker)
@@ -593,8 +704,11 @@ for _, special in ipairs({false, true}) do
   wait_for(function() return windows() == 1 and vim.api.nvim_get_current_buf() == buf end)
 end
 ''',
-    'detail Enter and o open the selected working tree file without restoring search': r'''
+    'detail Enter and o open the selected working tree file at its first change': r'''
 vim.cmd.cd('/tmp')
+local patch = git({'diff', '--unified=0', 'HEAD^', 'HEAD', '--', 'README_ZH.md'})
+local expected = tonumber(patch:match('@@ %-%d+,?%d* %+(%d+)'))
+assert(expected and expected > 1)
 for _, entry in ipairs({{'list', '<CR>'}, {'preview', 'o'}}) do
   vim.cmd.edit(REPO .. '/README.md')
   local picker = direct_log()
@@ -607,8 +721,57 @@ for _, entry in ipairs({{'list', '<CR>'}, {'preview', 'o'}}) do
   key(entry[2])
   wait_for(function() return windows() == 1 end)
   assert(vim.api.nvim_buf_get_name(0) == REPO .. '/README_ZH.md')
+  assert(vim.api.nvim_win_get_cursor(0)[1] == expected)
   assert(#Snacks.picker.get() == 0)
 end
+''',
+    'first hunk navigation handles context, deletions, missing hunks and current file bounds': r'''
+local header = 'diff --git a/README_ZH.md b/README_ZH.md\n--- a/README_ZH.md\n+++ b/README_ZH.md\n'
+local cases = {
+  {header .. '@@ -6,4 +6,4 @@\n context\n context\n-old\n+new\n context\n', 8},
+  {header .. '@@ -6,3 +6,2 @@\n context\n-deleted\n context\n', 7},
+  {header .. '@@ -6 +5,0 @@\n-deleted\n', 6},
+  {header .. '@@ -999 +999 @@\n-old\n+new\n', 'last'},
+  {'diff --git a/old.md b/README_ZH.md\nsimilarity index 100%\nrename from old.md\nrename to README_ZH.md\n'},
+  {'diff --git a/README_ZH.md b/README_ZH.md\nBinary files differ\n'},
+  {nil}, -- A failed diff query must still open the file.
+}
+for _, case in ipairs(cases) do
+  vim.cmd.edit(REPO .. '/README.md')
+  local picker = direct_log()
+  diff_loaded(picker)
+  for index, item in ipairs(picker:items()) do
+    if item.file == 'README_ZH.md' then picker.list:view(index) end
+  end
+  local system = vim.system
+  vim.system = function(command, opts, callback)
+    if vim.tbl_contains(command, 'diff') then
+      command = case[1] and {'printf', '%s', case[1]} or {'git', '--invalid-hunk-test-option'}
+    end
+    return system(command, opts, callback)
+  end
+  key('<CR>')
+  wait_for(function() return windows() == 1 end)
+  vim.system = system
+  assert(vim.api.nvim_buf_get_name(0) == REPO .. '/README_ZH.md')
+  local expected = case[2] == 'last' and vim.api.nvim_buf_line_count(0) or case[2]
+  if expected then assert(vim.api.nvim_win_get_cursor(0)[1] == expected) end
+end
+''',
+    'closing the picker cancels a pending first hunk confirmation': r'''
+local main, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+local picker = direct_log()
+diff_loaded(picker)
+local release = hold_exits()
+key('<CR>')
+assert(not picker.closed)
+picker:close()
+wait_for(function() return windows() == 1 end)
+local cursor = vim.api.nvim_win_get_cursor(main)
+release()
+assert(vim.api.nvim_get_current_buf() == buf)
+assert(vim.deep_equal(vim.api.nvim_win_get_cursor(main), cursor))
+assert(#Snacks.picker.get() == 0)
 ''',
     'missing working tree file reports its path and keeps the details open': r'''
 local picker = direct_log()
@@ -844,6 +1007,9 @@ assert(history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit ..
 assert(not history_win(picker):text():find('▶ ' .. picker.opts.icons.git.commit .. git({'rev-parse', '--short', older}), 1, true))
 assert(preview_title(picker) == subject)
 local expected = vim.split(git({'diff-tree', '--no-commit-id', '--name-only', '-r', older}), '\n')
+expected = vim.tbl_filter(function(file)
+  return not ('/' .. file .. '/'):find('/tests/', 1, true)
+end, expected)
 local files = vim.tbl_map(function(item) return item.file end, picker:items())
 table.sort(expected)
 table.sort(files)

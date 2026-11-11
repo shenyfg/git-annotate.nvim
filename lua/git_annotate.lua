@@ -576,6 +576,27 @@ local function diff_succeeded(result, allow_exit_one)
 	return result.code == 0 or result.truncated or (allow_exit_one and result.code == 1)
 end
 
+--- Find the first changed line on the new side, skipping leading context.
+local function first_change_line(output)
+	local diff = require("snacks.picker.source.diff").parse(vim.split(output, "\n", { plain = true }))
+	for _, block in ipairs(diff.blocks) do
+		local hunk = not block.delete and block.hunks[1]
+		if hunk then
+			local line = hunk.right.line
+			if hunk.right.count == 0 then
+				return line + 1
+			end
+			for i = 2, #hunk.diff do
+				if hunk.diff[i]:sub(1, 1) ~= " " then
+					break
+				end
+				line = line + 1
+			end
+			return line
+		end
+	end
+end
+
 --- diff 标题仅展示提交主题，文件路径由 diff 内容展示
 local function commit_preview_title(state)
 	local title = state.working and "Working Tree · Not committed yet" or state.subject or "Loading commit info…"
@@ -785,6 +806,7 @@ end
 --- @return table
 local function change_picker_opts(state, ann_win, main_win, source_file)
 	local info_lines, info_process, info_float
+	local show_tests = false
 	local filter_float
 	local info_request = 0
 	local files_cancel, active_picker
@@ -1023,15 +1045,42 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			vim.notify("Git annotate: source window closed", vim.log.levels.WARN)
 			return
 		end
-		local ok, err = pcall(vim.api.nvim_win_call, main_win, function()
-			vim.cmd.edit({ args = { path } })
-		end)
-		if not ok then
-			vim.notify("Git annotate: " .. tostring(err), vim.log.levels.ERROR)
-			return
-		end
-		state.opened_file = true
-		picker:close()
+		local revision = state.revision
+		local source_buf = vim.api.nvim_win_get_buf(main_win)
+		local command, allow_exit_one = file_diff_command(state, item)
+		collect_bounded(command, function(result)
+			if picker.closed or state.revision ~= revision or picker:current() ~= item then
+				return
+			end
+			if not vim.api.nvim_win_is_valid(main_win) or vim.api.nvim_win_get_buf(main_win) ~= source_buf then
+				return
+			end
+			local current_stat = vim.uv.fs_stat(path)
+			if not current_stat or current_stat.type ~= "file" then
+				vim.notify("Git annotate: file no longer exists: " .. path, vim.log.levels.WARN)
+				return
+			end
+			local line
+			if diff_succeeded(result, allow_exit_one) then
+				line = first_change_line(result.stdout)
+			else
+				vim.notify("Git annotate: unable to locate first hunk: " .. result.stderr, vim.log.levels.WARN)
+			end
+			local ok, err = pcall(vim.api.nvim_win_call, main_win, function()
+				vim.cmd.edit({ args = { path } })
+				if line then
+					line = math.max(1, math.min(line, vim.api.nvim_buf_line_count(0)))
+					vim.api.nvim_win_set_cursor(main_win, { line, 0 })
+					vim.cmd("normal! zvzz")
+				end
+			end)
+			if not ok then
+				vim.notify("Git annotate: " .. tostring(err), vim.log.levels.ERROR)
+				return
+			end
+			state.opened_file = true
+			picker:close()
+		end, state.cwd)
 	end
 
 	local function keys()
@@ -1039,6 +1088,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			["<CR>"] = { "confirm", mode = { "i", "n" }, desc = "Open file in working tree" },
 			["o"] = { "confirm", mode = "n", desc = "Open file in working tree" },
 			["f"] = { "git_annotate_filter", mode = "n", desc = "Filter commit history" },
+			["<C-t>"] = { "git_annotate_toggle_tests", mode = { "i", "n" }, desc = "Toggle tests directory" },
 			["<C-o>"] = {
 				"git_annotate_toggle_diff",
 				mode = { "i", "n" },
@@ -1057,6 +1107,10 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		focus = "list",
 		format = "file",
 		show_empty = true,
+		transform = function(item)
+			local path = "/" .. (item.file or ""):gsub("\\", "/") .. "/"
+			return show_tests or not path:find("/tests/", 1, true)
+		end,
 		finder = function(opts, ctx)
 			if state.working then
 				return require("snacks.picker.source.git").status(opts, ctx)
@@ -1066,6 +1120,7 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		layout = function()
 			local wide = vim.o.columns >= 100
 			return {
+				fullscreen = true,
 				preview = true,
 				layout = {
 					box = wide and "horizontal" or "vertical",
@@ -1096,6 +1151,15 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			preview_file_change(ctx, state)
 		end,
 		actions = {
+			git_annotate_toggle_tests = function(picker)
+				show_tests = not show_tests
+				Snacks.notify((show_tests and "Disabled" or "Enabled") .. " **Tests Directory Filter**", {
+					title = "Tests Directory Filter",
+					level = show_tests and vim.log.levels.WARN or vim.log.levels.INFO,
+				})
+				picker.list:set_target()
+				picker:find()
+			end,
 			git_annotate_filter = filter_commits,
 			git_annotate_toggle_diff = toggle_diff_focus,
 			git_annotate_older = function()
@@ -1480,6 +1544,36 @@ function M._open_sidebar(annotations, bufnr, main_win, top, current_line, cwd)
 			end
 		end
 	end
+
+	local previous_win
+	vim.api.nvim_create_autocmd({ "WinLeave", "WinEnter" }, {
+		group = group,
+		callback = function(event)
+			local target = vim.api.nvim_get_current_win()
+			if event.event == "WinLeave" then
+				previous_win = target
+				return
+			end
+			local source = target == main_win and ann_win or target == ann_win and main_win or nil
+			if not source or source ~= previous_win then
+				return
+			end
+			if
+				cleaned
+				or not vim.api.nvim_win_is_valid(source)
+				or vim.api.nvim_win_get_buf(main_win) ~= bufnr
+				or vim.api.nvim_win_get_buf(ann_win) ~= ann_buf
+			then
+				return
+			end
+			local cursor = vim.api.nvim_win_get_cursor(target)
+			cursor[1] = math.min(
+				vim.api.nvim_win_get_cursor(source)[1],
+				vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(target))
+			)
+			vim.api.nvim_win_set_cursor(target, cursor)
+		end,
+	})
 
 	vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
 		group = group,
