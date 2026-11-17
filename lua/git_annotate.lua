@@ -857,7 +857,6 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		cwd = state.cwd,
 		sha = state.sha,
 		working = state.working,
-		run = collect_bounded,
 		format = function(item)
 			return Snacks.picker.format.git_log(item, active_picker)
 		end,

@@ -1,26 +1,33 @@
 local M = {}
 M.__index = M
 
-local PAGE_SIZE = 200
+local SLICE_NS = 3 * 1000 * 1000
+local REFRESH_MS = 33
 local ns = vim.api.nvim_create_namespace("git_annotate_history")
 local selection_ns = vim.api.nvim_create_namespace("git_annotate_history_selection")
 
---- @param opts {cwd: string, sha?: string, working: boolean, run: function, on_select: function, format: function}
+local function cancel_timer(timer)
+	if timer and not timer:is_closing() then
+		timer:stop()
+		timer:close()
+	end
+end
+
+--- @param opts {cwd: string, sha?: string, working: boolean, on_select: function, format: function}
 function M.new(opts)
 	local self = setmetatable({
 		opts = opts,
 		items = {},
 		visible = {},
+		positions = {},
 		filter = "",
 		tokens = {},
-		offset = 0,
 		more = true,
-		message = "Loading history…",
 	}, M)
 	if opts.working then
 		self.items[1] = { working = true, subject = "Working Tree · Not committed yet" }
 		self.index = 1
-		self.visible[1] = 1
+		self.visible[1], self.positions[1] = 1, 1
 	end
 	return self
 end
@@ -34,20 +41,77 @@ end
 
 --- Match all space-separated terms literally, ignoring case.
 function M:matches(item)
-	local text = vim.fn.tolower((item.sha or "") .. " " .. item.subject .. " " .. (item.author or ""))
+	if #self.tokens == 0 then
+		return true
+	end
+	item.search = item.search or vim.fn.tolower((item.sha or "") .. " " .. item.subject .. " " .. (item.author or ""))
 	for _, token in ipairs(self.tokens) do
-		if not text:find(token, 1, true) then
+		if not item.search:find(token, 1, true) then
 			return false
 		end
 	end
 	return true
 end
 
+function M:add_match(index)
+	if self:matches(self.items[index]) then
+		self.visible[#self.visible + 1] = index
+		self.positions[index] = #self.visible
+	end
+end
+
 function M:select_match()
-	if self.filter ~= "" and self.visible[1] and not vim.tbl_contains(self.visible, self.index) then
+	if self.restore_selection and not self.index then
+		return
+	end
+	-- Wait until the current selection has been checked before choosing a replacement.
+	if self.filter_next and self.index and self.filter_next <= self.index then
+		return
+	end
+	if self.filter ~= "" and self.visible[1] and not self.positions[self.index] then
 		self.index = self.visible[1]
 		self.opts.on_select(self.items[self.index])
 	end
+end
+
+function M:refresh()
+	if self.closed then
+		return
+	end
+	self:select_match()
+	local position = self.positions[self.index]
+	if self.pending_move and position and self.visible[position + 1] then
+		self:move(1)
+	elseif not self.more and not self.filter_next then
+		self.pending_move = nil
+	end
+	if not self.render_timer and not self.closed then
+		self.render_timer = vim.defer_fn(function()
+			self.render_timer = nil
+			self:render()
+		end, REFRESH_MS)
+	end
+end
+
+--- Scan loaded records in short slices; arriving records join the same scan.
+function M:scan_filter()
+	if self.closed then
+		return
+	end
+	local deadline = vim.uv.hrtime() + SLICE_NS
+	while self.filter_next <= #self.items and vim.uv.hrtime() < deadline do
+		self:add_match(self.filter_next)
+		self.filter_next = self.filter_next + 1
+	end
+	if self.filter_next > #self.items then
+		self.filter_next = nil
+	else
+		self.filter_timer = vim.defer_fn(function()
+			self.filter_timer = nil
+			self:scan_filter()
+		end, 1)
+	end
+	self:refresh()
 end
 
 --- Update the visible history while retaining already loaded commits.
@@ -55,55 +119,83 @@ function M:set_filter(query, restore_index)
 	if self.closed then
 		return
 	end
+	cancel_timer(self.filter_timer)
+	self.filter_timer = nil
 	self.filter = vim.trim(query)
 	self.tokens = vim.split(vim.fn.tolower(query), "%s+", { trimempty = true })
-	self.pending_move = nil
-	self.visible = {}
-	for index, item in ipairs(self.items) do
-		if self:matches(item) then
-			self.visible[#self.visible + 1] = index
-		end
-	end
+	self.pending_move, self.first, self.render_key = nil, nil, nil
+	self.restore_selection = nil
+	self.visible, self.positions = {}, {}
 	if restore_index and self.index ~= restore_index then
 		self.index = restore_index
 		self.opts.on_select(self.items[self.index])
 	end
-	self:select_match()
+	self.filter_next = 1
+	self:scan_filter()
 	self:render()
-	if self.filter ~= "" then
-		self:load()
-	end
 end
 
+--- Draw at most three screens, keeping logical indices independent of buffer rows.
 function M:render(win)
 	win = win or self.win
-	if not win or not win:buf_valid() then
+	self.win = win
+	if self.closed or not win or not win:buf_valid() then
 		return
 	end
-	self.win = win
-	local lines = {}
-	if self.filter ~= "" then
-		local count = #self.visible .. (self.more and "+ matches" or " matches")
-		lines[1] = { { "Filter: " .. self.filter .. " · " .. count, "DiagnosticInfo" } }
+	local height = win:win_valid() and vim.api.nvim_win_get_height(win.win) or 10
+	local capacity = math.max(3, height * 3)
+	local count = #self.visible
+	local position = self.positions[self.index]
+	local first = self.first or 1
+	if position and (position < first + height or position > first + capacity - height) then
+		first = math.max(1, position - math.floor(capacity / 2))
 	end
-	self.rows = {}
-	for _, index in ipairs(self.visible) do
-		local item = self.items[index]
-		self.rows[index] = #lines + 1
-		local line = { { self:is_origin(item) and "▶ " or "  ", "DiagnosticInfo" } }
-		local content = item.working and { { item.subject, "SnacksPickerGitMsg" } } or self.opts.format(item)
-		Snacks.picker.highlight.extend(line, content)
-		lines[#lines + 1] = line
+	first = math.max(1, math.min(first, count - capacity + 1))
+	local last = math.min(count, first + capacity - 1)
+	local loading = self.more or self.filter_next ~= nil
+	local message = self.message or (loading and "Loading history…" or nil)
+	if not self.index and self.filter == "" then
+		last = 0
+		message = self.message or (loading and "Locating current commit…" or "Current commit not found")
+	elseif self.filter ~= "" and count == 0 then
+		message = self.message or (loading and "Filtering history…" or "No matching commits · diff unchanged")
+	elseif self.filter ~= "" and loading then
+		message = self.message or "Filtering history…"
 	end
-	local message = self.message
-		or (self.more and (self.filter ~= "" and "Filtering history…" or "… n: load older commits"))
-	if self.filter ~= "" and #self.visible == 0 then
-		lines[#lines + 1] = { { "No matching commits · diff unchanged", "Comment" } }
+	local key = table.concat({
+		self.filter,
+		self.visible[first] or 0,
+		self.visible[last] or 0,
+		self.filter ~= "" and count or 0,
+		message or "",
+	}, "\0")
+	self.first = first
+	if self.render_key ~= key or self.render_buf ~= win.buf then
+		local lines = {}
+		if self.filter ~= "" then
+			lines[1] = {
+				{
+					"Filter: " .. self.filter .. " · " .. count .. (loading and "+ matches" or " matches"),
+					"DiagnosticInfo",
+				},
+			}
+		end
+		self.rows = {}
+		for row = first, last do
+			local index = self.visible[row]
+			local item = self.items[index]
+			self.rows[index] = #lines + 1
+			local line = { { self:is_origin(item) and "▶ " or "  ", "DiagnosticInfo" } }
+			local content = item.working and { { item.subject, "SnacksPickerGitMsg" } } or self.opts.format(item)
+			Snacks.picker.highlight.extend(line, content)
+			lines[#lines + 1] = line
+		end
+		if message or #lines == 0 then
+			lines[#lines + 1] = { { message or "No commits", "Comment" } }
+		end
+		Snacks.picker.highlight.render(win.buf, ns, lines)
+		self.render_key, self.render_buf = key, win.buf
 	end
-	if message or #lines == 0 then
-		lines[#lines + 1] = { { message or "No commits", "Comment" } }
-	end
-	Snacks.picker.highlight.render(win.buf, ns, lines)
 	self:show_selection()
 end
 
@@ -137,89 +229,83 @@ function M:layout(height)
 		b = { git_annotate_history = true },
 		on_win = function(win)
 			self:render(win)
+			vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+				group = win.augroup,
+				callback = function()
+					self:refresh()
+				end,
+			})
 		end,
 	}
 end
 
 function M:load()
-	if self.closed or self.process or not self.more then
+	if self.closed then
 		return
 	end
-	local command = {
-		"git",
-		"--no-pager",
-		"log",
-		"--all",
-		"--date-order",
-		"--no-decorate",
-		"--no-color",
-		"-z",
-		"--format=%H%x00%h%x00%ch%x00%s%x00%an",
-		"--max-count=" .. (PAGE_SIZE + 1),
-		"--skip=" .. self.offset,
-		"HEAD",
-	}
-	if self.opts.sha then
-		command[#command + 1] = self.opts.sha
+	if self.started then
+		if self.filter_next and not self.filter_timer then
+			self:scan_filter()
+		end
+		self:refresh()
+		return
 	end
-	command[#command + 1] = "--"
+	if self.restart then
+		local selected = self.items[self.index]
+		self.locate_sha = selected and selected.sha or self.opts.sha
+		self.restore_selection = selected and not selected.working
+		self.items, self.visible, self.positions, self.index = {}, {}, {}, nil
+		if self.opts.working then
+			self.items[1] = { working = true, subject = "Working Tree · Not committed yet" }
+			self:add_match(1)
+			self.index = not self.restore_selection and 1 or nil
+		end
+		self.filter_next, self.first, self.render_key, self.message, self.restart = nil, nil, nil, nil, nil
+	end
+	self.started = true
 	self.request = (self.request or 0) + 1
 	local request = self.request
-	self.process = self.opts.run(command, function(result)
-		if self.closed or request ~= self.request then
-			return
-		end
-		self.process = nil
-		if result.code ~= 0 and not result.truncated then
-			self.message = "History unavailable: " .. vim.trim(result.stderr):gsub("[\r\n]+", " ")
-			self.more = false
-			self:render()
-			return
-		end
-		local fields = vim.split(result.stdout, "\0", { plain = true })
-		local count = math.floor((#fields - 1) / 5)
-		self.more = count > PAGE_SIZE or result.truncated
-		local added = math.min(count, PAGE_SIZE)
-		for i = 1, added do
-			local offset = (i - 1) * 5
-			local sha, subject = fields[offset + 1], fields[offset + 4]
-			subject = subject ~= "" and subject or "(No commit message)"
+	local function valid()
+		return not self.closed and self.request == request
+	end
+	self.cancel = require("git_annotate.history_stream").start({
+		cwd = self.opts.cwd,
+		sha = self.opts.sha,
+		on_record = function(fields)
+			if not valid() then
+				return
+			end
+			local subject = fields[4] ~= "" and fields[4] or "(No commit message)"
 			self.items[#self.items + 1] = {
-				sha = sha,
-				commit = fields[offset + 2],
-				date = fields[offset + 3],
+				sha = fields[1],
+				commit = fields[2],
+				date = fields[3],
 				subject = subject,
 				msg = subject,
-				author = fields[offset + 5],
+				author = fields[5],
 			}
-			if self:matches(self.items[#self.items]) then
-				self.visible[#self.visible + 1] = #self.items
+			if not self.filter_next then
+				self:add_match(#self.items)
 			end
-			if not self.index and sha == self.opts.sha then
+			if not self.index and fields[1] == (self.locate_sha or self.opts.sha) then
 				self.index = #self.items
 			end
-		end
-		self.offset = self.offset + added
-		self.message = nil
-		if added == 0 and self.more then
-			self.more = false
-			self.message = "History entry exceeds the 2 MiB limit"
-		end
-		if not self.index then
-			self.message = self.more and "Locating current commit…" or "Current commit not found"
-		end
-		self:select_match()
-		self:render()
-		if not self.index and self.more then
-			self:load()
-		elseif self.pending_move then
-			self.pending_move = nil
-			self:move(1)
-		end
-		if self.filter ~= "" then
-			self:load()
-		end
-	end, self.opts.cwd)
+		end,
+		on_batch = function()
+			if valid() then
+				self:refresh()
+			end
+		end,
+		on_exit = function(err)
+			if not valid() then
+				return
+			end
+			self.cancel, self.more = nil, false
+			self.restore_selection = nil
+			self.message = err and "History unavailable: " .. vim.trim(err):gsub("[\r\n]+", " ") or nil
+			self:refresh()
+		end,
+	})
 end
 
 function M:move(delta)
@@ -227,20 +313,13 @@ function M:move(delta)
 		return
 	end
 	self.pending_move = nil
-	local position
-	for row, index in ipairs(self.visible) do
-		if index == self.index then
-			position = row
-			break
-		end
-	end
+	local position = self.positions[self.index]
 	if not position then
 		return
 	end
 	position = position + delta
-	if position > #self.visible and self.more then
+	if position > #self.visible and (self.more or self.filter_next) then
 		self.pending_move = true
-		self:load()
 		return
 	end
 	local index = self.visible[position]
@@ -248,16 +327,20 @@ function M:move(delta)
 		return
 	end
 	self.index = index
-	self:show_selection()
+	self:render()
 	self.opts.on_select(self.items[index])
 end
 
 function M:close()
 	self.closed = true
 	self.request = (self.request or 0) + 1
-	if self.process then
-		pcall(self.process.kill, self.process, 15)
-		self.process = nil
+	cancel_timer(self.render_timer)
+	cancel_timer(self.filter_timer)
+	self.render_timer, self.filter_timer = nil, nil
+	if self.cancel then
+		self.cancel()
+		self.cancel = nil
+		self.started, self.restart = false, true
 	end
 end
 

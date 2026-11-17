@@ -66,7 +66,7 @@ Repository history appears below the changed files, including commits reachable 
 - Per-file previews opened with `d` and commit file lists are limited to 2 MiB. Oversized output is truncated and clearly marked.
 - Root commits also use per-file previews, loading only the selected file's diff.
 - Commit information is limited to 2 MiB, with a truncation notice in the full view opened with `K`.
-- History loads in batches of 200 commits, with a 2 MiB limit per request. Browsing older entries loads further batches as needed; opening an older commit continues loading until it is located.
+- History streams from one background Git process and locates the initial commit as records arrive. Parsing and filtering run in short slices; the history pane renders at most three screens while retaining loaded records for navigation and filtering. Individual history entries are limited to 2 MiB, and closing the picker cancels the stream.
 
 ## Requirements
 

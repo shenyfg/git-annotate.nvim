@@ -326,127 +326,250 @@ assert(sidebar_open())
 ''',
 }
 
-CASES['history pagination locates an older initial commit and ignores results after close'] = r'''
+HISTORY_PREAMBLE = r'''
 local History = require('git_annotate.history')
 local requests, selected, kills = {}, {}, 0
 local function sha(i) return string.format('%040x', i) end
-local function output(first, last)
-  local fields = {}
-  for i = first, last do
-    fields[#fields + 1] = sha(i)
-    fields[#fields + 1] = sha(i):sub(1, 7)
-    fields[#fields + 1] = '2 minutes ago'
-    fields[#fields + 1] = i == 205 and '' or 'Commit ' .. i
-    fields[#fields + 1] = 'Test Author'
-  end
-  return table.concat(fields, '\0') .. '\0'
+require('git_annotate.history_stream').start = function(opts)
+  requests[#requests + 1] = opts
+  return function() kills = kills + 1 end
 end
-local history = History.new({cwd = REPO, sha = sha(205), working = false,
-  on_select = function(item) selected[#selected + 1] = item.sha end,
-  run = function(command, callback)
-    requests[#requests + 1] = {command = command, callback = callback}
-    return {kill = function() kills = kills + 1 end}
-  end,
-})
+local function records(request, first, last)
+  for i = first, last do
+    local match = i == 205 or i == 407
+    request.on_record({sha(i), string.format('%08x', i), '2 minutes ago',
+      match and 'Fix [x] issue' or 'Other', match and 'Alice' or 'Bob'})
+  end
+  request.on_batch()
+end
+local function history_at(index)
+  return History.new({cwd = REPO, sha = sha(index), working = false,
+    on_select = function(item) selected[#selected + 1] = item.sha end})
+end
+'''
+
+CASES['one history stream locates an older commit and ignores results after close'] = HISTORY_PREAMBLE + r'''
+local history = history_at(205)
 history:load()
-assert(vim.tbl_contains(requests[1].command, '--all'))
-assert(vim.tbl_contains(requests[1].command, sha(205)))
-assert(vim.tbl_contains(requests[1].command, '--skip=0'))
-requests[1].callback({code = 0, stdout = output(1, 201), stderr = '', truncated = false})
-assert(#history.items == 200 and not history.index and #requests == 2)
-assert(vim.tbl_contains(requests[2].command, '--skip=200'))
-requests[2].callback({code = 0, stdout = output(201, 205), stderr = '', truncated = false})
-assert(history.index == 205 and not history.more and #selected == 0)
+assert(requests[1].sha == sha(205))
+records(requests[1], 1, 200)
+assert(#history.items == 200 and not history.index and #requests == 1)
+records(requests[1], 201, 204)
+requests[1].on_record({sha(205), '000000cd', 'now', '', 'Author'})
+requests[1].on_batch()
+assert(history.index == 205 and history.more and #selected == 0)
 assert(history.items[205].subject == '(No commit message)')
 history:move(-1)
 assert(selected[1] == sha(204))
 history:move(1)
 history:move(1)
-assert(#selected == 2 and history.index == 205)
-history.more = true
+assert(#selected == 2 and history.index == 205 and history.pending_move)
 history:load()
+assert(#requests == 1)
 history:close()
-requests[3].callback({code = 0, stdout = output(206, 210), stderr = '', truncated = false})
-assert(#history.items == 205 and kills == 1)
+records(requests[1], 206, 210)
+requests[1].on_exit('late error')
+assert(#history.items == 205 and kills == 1 and not history.message)
 '''
 
-CASES['history page boundary honors a newer selection while older commits load'] = r'''
-local History = require('git_annotate.history')
-local requests, selected = {}, {}
-local function sha(i) return string.format('%040x', i) end
-local function output(first, last)
-  local fields = {}
-  for i = first, last do
-    fields[#fields + 1] = sha(i)
-    fields[#fields + 1] = sha(i):sub(1, 7)
-    fields[#fields + 1] = '2 minutes ago'
-    fields[#fields + 1] = 'Commit ' .. i
-    fields[#fields + 1] = 'Test Author'
-  end
-  return table.concat(fields, '\0') .. '\0'
-end
-local history = History.new({cwd = REPO, sha = sha(1), working = false,
-  on_select = function(item) selected[#selected + 1] = item.sha end,
-  run = function(command, callback)
-    requests[#requests + 1] = callback
-    return {kill = function() end}
-  end,
-})
+CASES['stream boundary honors a newer selection and completes a pending older move'] = HISTORY_PREAMBLE + r'''
+local history = history_at(1)
 history:load()
-requests[1]({code = 0, stdout = output(1, 201), stderr = '', truncated = false})
+records(requests[1], 1, 200)
 for _ = 1, 200 do history:move(1) end
-assert(history.index == 200 and history.pending_move and #requests == 2)
+assert(history.index == 200 and history.pending_move and #requests == 1)
 history:move(-1)
-requests[2]({code = 0, stdout = output(201, 210), stderr = '', truncated = false})
+records(requests[1], 201, 210)
 assert(history.index == 199 and selected[#selected] == sha(199))
-history:move(1)
-history:move(1)
-assert(history.index == 201 and selected[#selected] == sha(201))
+for _ = 1, 12 do history:move(1) end
+assert(history.index == 210 and history.pending_move)
+records(requests[1], 211, 220)
+assert(history.index == 211 and not history.pending_move)
+requests[1].on_exit()
+assert(not history.more)
 history:close()
+assert(kills == 0)
 '''
 
-CASES['commit filtering loads older pages and applies the latest literal query'] = r'''
-local History = require('git_annotate.history')
-local requests, selected = {}, {}
-local function sha(i) return string.format('%040x', i) end
-local function output(first, last)
-  local fields = {}
-  for i = first, last do
-    local match = i == 205 or i == 407
-    vim.list_extend(fields, {sha(i), sha(i):sub(1, 7), '2 minutes ago',
-      match and 'Fix [x] issue' or 'Other', match and 'Alice' or 'Bob'})
-  end
-  return table.concat(fields, '\0') .. '\0'
-end
-local history = History.new({cwd = REPO, sha = sha(1), working = false,
-  on_select = function(item) selected[#selected + 1] = item.sha end,
-  run = function(command, callback)
-    requests[#requests + 1] = {command = command, callback = callback}
-    return {kill = function() end}
-  end,
-})
+CASES['commit filtering processes arriving records and applies the latest literal query'] = HISTORY_PREAMBLE + r'''
+local history = history_at(1)
 history:load()
-requests[1].callback({code = 0, stdout = output(1, 201), stderr = ''})
+records(requests[1], 1, 200)
 history:set_filter('ALICE [x]')
-assert(#history.visible == 0 and #requests == 2)
-requests[2].callback({code = 0, stdout = output(201, 401), stderr = ''})
-assert(history.index == 205 and #history.visible == 1 and #requests == 3)
-assert(vim.tbl_contains(requests[3].command, '--skip=400'))
+wait_for(function() return not history.filter_next end)
+assert(#history.visible == 0 and #requests == 1)
+records(requests[1], 201, 400)
+assert(history.index == 205 and #history.visible == 1 and #requests == 1)
 history:set_filter('no-match')
-requests[3].callback({code = 0, stdout = output(401, 410), stderr = ''})
+wait_for(function() return not history.filter_next end)
+records(requests[1], 401, 410)
+requests[1].on_exit()
 assert(#history.visible == 0 and not history.more and history.index == 205)
 history:set_filter('alice [x]')
+wait_for(function() return not history.filter_next end)
 assert(#history.visible == 2)
 history:move(1)
 assert(history.index == 407)
 history:move(-1)
 assert(history.index == 205)
 history:set_filter(sha(407))
+wait_for(function() return not history.filter_next end)
 assert(#history.visible == 1 and history.index == 407)
 history:set_filter('  ', 1)
+wait_for(function() return not history.filter_next end)
 assert(#history.visible == 410 and history.index == 1 and history.filter == '')
 assert(selected[#selected] == sha(1))
 history:close()
+'''
+
+CASES['large filter scans yield and cancel superseded scans without duplicating arriving records'] = HISTORY_PREAMBLE + r'''
+local history = history_at(40000)
+history:load()
+records(requests[1], 1, 40000)
+local matches = history.matches
+history.matches = function(...)
+  local deadline = vim.uv.hrtime() + 10000
+  while vim.uv.hrtime() < deadline do end
+  return matches(...)
+end
+history:set_filter('alice')
+assert(history.filter_next, 'large filter blocked until its scan completed')
+local input_ran = false
+vim.defer_fn(function() input_ran = true end, 1)
+history:set_filter('bob', 40000)
+records(requests[1], 40001, 40100)
+assert(history.index == 40000, 'restore was overwritten before its row was checked')
+wait_for(function() return not history.filter_next end)
+assert(input_ran and history.index == 40000 and #history.visible == 40098)
+for row,index in ipairs(history.visible) do assert(history.positions[index] == row) end
+history:set_filter('alice')
+assert(history.filter_next)
+history:close()
+local count = #history.visible
+vim.wait(50)
+assert(#history.visible == count and kills == 1)
+'''
+
+CASES['resuming interrupted history restarts one stream and preserves selection and filter'] = HISTORY_PREAMBLE + r'''
+local history=history_at(205)
+history:load()
+records(requests[1],1,210)
+history:move(1)
+history:set_filter('bob')
+wait_for(function() return not history.filter_next end)
+assert(history.index==206)
+history:close()
+history.closed=false
+history:load()
+assert(#requests==2 and #history.items==0 and history.filter=='bob')
+records(requests[1],211,220)
+requests[1].on_exit('stale failure')
+assert(#history.items==0 and history.more and not history.message)
+records(requests[2],1,200)
+assert(not history.index,'an early match replaced the restored selection')
+records(requests[2],201,220)
+assert(history.index==206 and history.opts.sha==sha(205))
+requests[2].on_exit()
+history:close()
+history.closed=false
+history:load()
+assert(#requests==2 and #history.items==220 and history.index==206)
+history:close()
+'''
+
+STREAM_PREAMBLE = r'''
+local Stream = require('git_annotate.history_stream')
+local spawn, calls, exited, command = vim.uv.spawn, 0, false, nil
+local producer
+vim.uv.spawn = function(cmd, opts, callback)
+  calls = calls + 1
+  command = opts.args
+  assert(cmd == 'git' and vim.tbl_contains(command, '--all') and vim.tbl_contains(command, '--date-order'))
+  for _,arg in ipairs(command) do assert(not arg:match('^--skip=') and not arg:match('^--max-count=')) end
+  opts.args = {'-c', producer}
+  return spawn('python3', opts, function(...)
+    exited = true
+    callback(...)
+  end)
+end
+'''
+
+CASES['history stream preserves split UTF-8 fields and reads beyond the old total output limit'] = STREAM_PREAMBLE + r'''
+producer = [=[
+import os
+first = ('%040x' % 1 + '\0abc\0now\0Fix 中文\nsecond line\0Élodie\0').encode()
+for value in first:
+    os.write(1, bytes([value]))
+for i in range(2, 30001):
+    os.write(1, ('%040x\0abc\0now\0%s\0Author\0' % (i, 'subject' * 10)).encode())
+]=]
+local count, done, failure, yielded = 0, false, nil, false
+local cancel = Stream.start({cwd=REPO, sha=string.rep('a',40),
+  on_record=function(fields)
+    count=count+1
+    assert(fields[1] == string.format('%040x',count))
+    if count==1 then assert(fields[4]=='Fix 中文\nsecond line' and fields[5]=='Élodie') end
+  end,
+  on_batch=function()
+    if not yielded then vim.defer_fn(function() yielded=true end,1) end
+  end,
+  on_exit=function(err) done=true;failure=err end,
+})
+wait_for(function() return done end)
+assert(not failure, failure)
+assert(count==30000 and calls==1 and exited and yielded)
+assert(vim.tbl_contains(command,string.rep('a',40)))
+cancel()
+'''
+
+CASES['closing a history stream stops its producer and queued parsing'] = STREAM_PREAMBLE + r'''
+producer = [=[
+import os
+while True:
+    os.write(1, (b'a'*40+b'\0abc\0now\0subject\0author\0')*1000)
+]=]
+local count, batches, finished = 0, 0, false
+local cancel
+cancel=Stream.start({cwd=REPO,
+  on_record=function() count=count+1 end,
+  on_batch=function() batches=batches+1;cancel() end,
+  on_exit=function() finished=true end,
+})
+wait_for(function() return exited end)
+local before=count
+vim.wait(50)
+assert(count>0 and count==before and batches==1 and not finished)
+'''
+
+CASES['history stream reports process errors incomplete records and oversized entries'] = STREAM_PREAMBLE + r'''
+local function check(source,expected)
+  producer=source
+  local done, failure=false,nil
+  Stream.start({cwd=REPO,on_record=function() end,on_batch=function() end,
+    on_exit=function(err) done=true;failure=err end})
+  wait_for(function() return done end)
+  assert(failure and failure:find(expected,1,true),tostring(failure))
+end
+check("import sys; sys.stderr.write('broken history'); sys.exit(7)", 'broken history')
+check("import os; os.write(1,b'partial')", 'Incomplete Git history record')
+check("import os; os.write(1,b'x'*(2*1024*1024+1))", 'History entry exceeds the 2 MiB limit')
+check("import os,signal; os.kill(os.getpid(),signal.SIGTERM)", 'terminated by signal')
+'''
+
+CASES['history reports spawn failure and cancellation suppresses a pending failure callback'] = r'''
+local Stream = require('git_annotate.history_stream')
+vim.uv.spawn = function() return nil, 'ENOENT' end
+local failure
+local opts={cwd=REPO,on_record=function() error('unexpected record') end,on_batch=function() end,
+  on_exit=function(err) failure=err end}
+Stream.start(opts)
+wait_for(function() return failure end)
+assert(failure:find('ENOENT',1,true))
+failure=nil
+local cancel=Stream.start(opts)
+cancel()
+vim.wait(50)
+assert(not failure)
 '''
 
 SNACKS_PREAMBLE = r'''
@@ -1302,6 +1425,7 @@ close_picker(picker)
 assert(not vim.api.nvim_buf_is_valid(buf))
 ''',
     'p and n update the selected commit, changed files, diff title and K details': r'''
+vim.cmd.edit(REPO .. '/lua/git_annotate.lua')
 local picker = open_picker()
 history_loaded(picker)
 local commits = vim.split(git({'log', '--all', '--date-order', '--format=%H', 'HEAD', '--'}), '\n')
@@ -1325,7 +1449,7 @@ local files = vim.tbl_map(function(item) return item.file end, picker:items())
 table.sort(expected)
 table.sort(files)
 assert(vim.deep_equal(files, expected), vim.inspect(files))
-assert(picker:current().file == 'README.md')
+assert(picker:current().file == 'lua/git_annotate.lua')
 key('K')
 wait_for(function() return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1]:find(older:sub(1, 7), 1, true) end)
 assert(vim.api.nvim_buf_get_lines(0, 0, -1, false)[5] == subject)
@@ -1617,6 +1741,75 @@ assert(windows() == count and picker.preview.win:text() == content)
 close_picker(picker)
 ''',
 }
+
+
+SNACKS_CASES['history rendering stays bounded while selection crosses window edges and resizes'] = HISTORY_PREAMBLE + r'''
+local history = history_at(9000)
+local formatted = 0
+history.opts.format = function(item)
+  formatted = formatted + 1
+  return {{item.commit .. ' ' .. item.subject, 'Comment'}}
+end
+local win = Snacks.win({width=80,height=10,bo={modifiable=false},show=true})
+history:load()
+records(requests[1],1,10000)
+requests[1].on_exit()
+history:render(win)
+assert(history.index==9000 and formatted<=30)
+assert(vim.api.nvim_buf_line_count(win.buf)<=30)
+local function check_selection()
+  local row=vim.api.nvim_win_get_cursor(win.win)[1]
+  assert(win:lines(row,row)[1]:find(string.format('%08x',history.index),1,true))
+  assert(vim.api.nvim_buf_line_count(win.buf)<=3*vim.api.nvim_win_get_height(win.win)+2)
+end
+check_selection()
+local changed=vim.api.nvim_buf_get_changedtick(win.buf)
+history:move(1)
+history:move(-1)
+assert(vim.api.nvim_buf_get_changedtick(win.buf)==changed,'ordinary navigation rewrote the history')
+for _=1,80 do history:move(1);check_selection() end
+for _=1,120 do history:move(-1);check_selection() end
+assert(history.index==8960)
+local before=formatted
+records(requests[1],10001,11000)
+history:render()
+assert(formatted==before,'appending off-screen history reformatted visible rows')
+win.opts.height=5
+win:update()
+history:render()
+check_selection()
+history:set_filter('alice [x]')
+wait_for(function() return not history.filter_next end)
+history:render()
+assert(#history.visible==2 and history.index==205)
+check_selection()
+history:move(1)
+assert(history.index==407)
+check_selection()
+history:set_filter('',9000)
+wait_for(function() return not history.filter_next end)
+history:render()
+check_selection()
+assert(history.index==9000 and #history.visible==11000)
+history:close()
+win:close()
+'''
+
+
+SNACKS_CASES['Snacks resume restores history display and navigation after closing the picker'] = r'''
+local picker=open_picker()
+history_loaded(picker)
+key('n')
+diff_loaded(picker)
+local selected=selected_commit(picker)
+close_picker(picker)
+picker=Snacks.picker.resume()
+history_loaded(picker)
+assert(selected_commit(picker)==selected)
+key('p')
+assert(selected_commit(picker)~=selected)
+close_picker(picker)
+'''
 
 
 def main():
