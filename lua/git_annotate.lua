@@ -4,9 +4,22 @@ local MAX_DIFF_PREVIEW_BYTES = 2 * 1024 * 1024
 local DIFF_LOADING_DELAY_MS = 3000
 local DETAIL_DELAY_MS = 40
 local FILTER_DELAY_MS = 100
+local WORKING_TREE_TITLE = "Working Tree · Not committed yet"
 local pending_request
 local log_request = 0
 local hover_requests = {}
+
+-- Git C-quotes paths containing control characters, quotes or non-ASCII bytes.
+local function blame_path(path)
+	if path:sub(1, 1) ~= '"' then
+		return path
+	end
+	local escapes = { a = "\a", b = "\b", t = "\t", n = "\n", v = "\v", f = "\f", r = "\r" }
+	return (path:sub(2, -2):gsub("\\([0-7]?[0-7]?.)", function(char)
+		local byte = tonumber(char, 8)
+		return byte and string.char(byte) or escapes[char] or char
+	end))
+end
 
 --- 解析 git blame --line-porcelain 输出
 --- 每个 commit 块格式：
@@ -26,10 +39,14 @@ local function parse_blame(blame_output)
 	local current = {}
 
 	for _, line in ipairs(blame_output) do
-		-- commit 块首行：40位 sha + 行号信息
-		local sha = line:match("^(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x) ")
+		local sha, orig_line = line:match("^(%x+) (%d+) %d+")
 		if sha then
 			current.sha = sha
+			current.orig_line = tonumber(orig_line)
+		end
+		local parent, old_path = line:match("^previous (%x+) (.+)$")
+		if parent then
+			current.parent_blob = parent .. ":" .. blame_path(old_path)
 		end
 
 		local a = line:match("^author (.+)")
@@ -41,10 +58,15 @@ local function parse_blame(blame_output)
 		if t then
 			current.author_time = tonumber(t)
 		end
+		local subject = line:match("^summary (.+)$")
+		if subject then
+			current.subject = subject
+		end
 
 		-- filename 是每个 commit 块的最后一个字段行，之后紧跟代码行
 		-- 以 filename 为触发点记录一条 annotation
-		if line:match("^filename ") then
+		local path = line:match("^filename (.+)$")
+		if path then
 			local author = current.author or "Unknown"
 			local author_time = current.author_time or 0
 			local text
@@ -74,6 +96,10 @@ local function parse_blame(blame_output)
 				text = text,
 				author_time = author_time,
 				sha = current.sha or "",
+				path = blame_path(path),
+				orig_line = current.orig_line,
+				parent_blob = current.parent_blob,
+				subject = current.subject,
 				uncommitted = (author == "Not Committed Yet"),
 			})
 			current = {}
@@ -159,7 +185,31 @@ local function is_uncommitted(sha)
 	return not sha or sha == "" or sha:match("^0+$")
 end
 
---- 在默认浏览器中打开提交，复用 Snacks 的远程地址与托管平台适配
+--- Open the first associated GitHub pull request, falling back to the selected commit URL.
+--- @param commit_url string
+--- @param open fun(url: string)
+local function open_pull_request_or_commit(commit_url, open)
+	local repo, sha = commit_url:match("^https://github%.com/([^/]+/[^/]+)/commit/(%x+)$")
+	if not repo then
+		open(commit_url)
+		return
+	end
+
+	local endpoint = ("repos/%s/commits/%s/pulls?per_page=1"):format(repo, sha)
+	local started = pcall(vim.system,
+		{ "gh", "api", "--hostname", "github.com", endpoint, "--jq", ".[].html_url" },
+		{ text = true, timeout = 5000 },
+		vim.schedule_wrap(function(result)
+			local pr_url = vim.trim(result.stdout or "")
+			open(result.code == 0 and pr_url ~= "" and pr_url or commit_url)
+		end)
+	)
+	if not started then
+		open(commit_url)
+	end
+end
+
+--- Browse the selected commit from the source window so Snacks resolves the correct remote.
 --- @param sha? string
 --- @param main_win integer
 local function open_commit_browser(sha, main_win)
@@ -178,7 +228,21 @@ local function open_commit_browser(sha, main_win)
 	end
 	-- 侧栏和 picker 都是临时 buffer；从源文件窗口解析仓库，避免使用错误的 cwd。
 	vim.api.nvim_win_call(main_win, function()
-		snacks.gitbrowse({ what = "commit", commit = sha })
+		local config = snacks.config.gitbrowse
+		snacks.gitbrowse({
+			what = "commit",
+			commit = sha,
+			notify = false,
+			open = function(commit_url)
+				open_pull_request_or_commit(commit_url, function(url)
+					if config.notify ~= false then
+						snacks.notify("Opening " .. url, { title = "Git Browse" })
+					end
+					local open = config.open or vim.ui.open
+					open(url)
+				end)
+			end,
+		})
 	end)
 end
 
@@ -366,16 +430,53 @@ local function commit_files_title(lines)
 	return string.format("%s  %d/%d/%d, %s", author, tonumber(year), tonumber(month), tonumber(day), time)
 end
 
---- 在浮动窗口中展示简要 commit 信息
---- @param sha string
---- @param ann_win integer
---- @param ann_buf integer
---- @param cwd string
-local function show_commit_float(sha, ann_win, ann_buf, cwd)
+local function annotation_title(annotation)
+	return is_uncommitted(annotation.sha) and WORKING_TREE_TITLE or annotation.subject or annotation.sha:sub(1, 8)
+end
+
+local function annotated_diff_command(annotation)
+	local command = { "git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color" }
+	if is_uncommitted(annotation.sha) then
+		vim.list_extend(command, { annotation.parent_blob or "HEAD", "--", annotation.path })
+	elseif annotation.parent_blob then
+		vim.list_extend(command, { annotation.parent_blob, annotation.sha .. ":" .. annotation.path })
+	else
+		-- Newly added files, including root commits, have no previous blob in blame.
+		command = { "git", "--literal-pathspecs", "show", "--format=", "--root", "--first-parent",
+			"--no-ext-diff", "--no-color", annotation.sha, "--", annotation.path }
+	end
+	return command
+end
+
+local function load_hunk(annotation, cwd, callback)
+	return collect_bounded(annotated_diff_command(annotation), function(result)
+		if result.truncated then
+			callback(nil, "File diff exceeds the 2 MiB preview limit")
+			return
+		elseif result.code ~= 0 then
+			callback(nil, vim.trim(result.stderr))
+			return
+		end
+		local diff = require("snacks.picker.source.diff").parse(diff_lines(result.stdout, false))
+		for _, block in ipairs(diff.blocks) do
+			for _, hunk in ipairs(block.hunks) do
+				local offset = annotation.orig_line - hunk.right.line
+				if offset >= 0 and offset < hunk.right.count then
+					callback(vim.list_extend(block.header, hunk.diff))
+					return
+				end
+			end
+		end
+		callback(nil, "No hunk found for the annotated line")
+	end, cwd)
+end
+
+--- Share focus, cancellation and dismissal between the sidebar's two hover windows.
+local function show_sidebar_float(key, ann_win, ann_buf, load, render, title)
 	local cursor = vim.api.nvim_win_get_cursor(ann_win)
 	local active = hover_requests[ann_buf]
 	if active then
-		if active.sha == sha and vim.deep_equal(active.cursor, cursor) then
+		if active.key == key and vim.deep_equal(active.cursor, cursor) then
 			active.focus()
 			return
 		end
@@ -406,7 +507,8 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			vim.api.nvim_set_current_win(float_win)
 		end
 	end
-	hover_requests[ann_buf] = { close = close, focus = focus, sha = sha, cursor = cursor }
+	local hover = { close = close, focus = focus, key = key }
+	hover_requests[ann_buf] = hover
 	local function close_after_leave()
 		-- Wait until the destination window is known, allowing sidebar -> hover focus.
 		vim.schedule(function()
@@ -415,7 +517,16 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			end
 		end)
 	end
-	vim.api.nvim_create_autocmd({ "CursorMoved", "BufWipeout" }, {
+	vim.api.nvim_create_autocmd("CursorMoved", {
+		buffer = ann_buf,
+		group = group,
+		callback = function()
+			if not vim.deep_equal(vim.api.nvim_win_get_cursor(ann_win), hover.cursor) then
+				close()
+			end
+		end,
+	})
+	vim.api.nvim_create_autocmd("BufWipeout", {
 		buffer = ann_buf,
 		group = group,
 		callback = close,
@@ -439,7 +550,7 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			not vim.api.nvim_win_is_valid(ann_win)
 			or vim.api.nvim_get_current_win() ~= ann_win
 			or vim.api.nvim_win_get_buf(ann_win) ~= ann_buf
-			or not vim.deep_equal(vim.api.nvim_win_get_cursor(ann_win), cursor)
+			or not vim.deep_equal(vim.api.nvim_win_get_cursor(ann_win), hover.cursor)
 		then
 			close()
 			return
@@ -447,18 +558,23 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 		while #lines > 1 and lines[#lines] == "" do
 			table.remove(lines)
 		end
-		local width = 0
+		local float_buf = float_win and vim.api.nvim_win_get_buf(float_win) or vim.api.nvim_create_buf(false, true)
+		vim.bo[float_buf].bufhidden = "wipe"
+		if render then
+			render(float_buf, lines)
+			lines = vim.api.nvim_buf_get_lines(float_buf, 0, -1, false)
+		else
+			vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
+			vim.bo[float_buf].filetype = "git"
+		end
+		vim.bo[float_buf].modifiable = false
+		local width = title and vim.fn.strdisplaywidth(title) + 2 or 0
 		for _, line in ipairs(lines) do
 			width = math.max(width, vim.fn.strdisplaywidth(line))
 		end
 		width = math.max(1, math.min(math.max(width, 20), math.floor(vim.o.columns * 0.7)))
 		local height = math.max(1, math.min(#lines, vim.o.lines - 4))
-		local float_buf = vim.api.nvim_create_buf(false, true)
-		vim.bo[float_buf].bufhidden = "wipe"
-		vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
-		vim.bo[float_buf].filetype = "git"
-		vim.bo[float_buf].modifiable = false
-		float_win = vim.api.nvim_open_win(float_buf, false, {
+		local config = {
 			relative = "cursor",
 			row = 1,
 			col = 0,
@@ -466,17 +582,24 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 			height = height,
 			style = "minimal",
 			border = "rounded",
+			title = title,
 			zindex = 50,
-		})
-		vim.wo[float_win].wrap = true
+		}
+		if float_win then
+			vim.api.nvim_win_set_config(float_win, config)
+			vim.api.nvim_win_set_cursor(float_win, { 1, 0 })
+			return
+		end
+		float_win = vim.api.nvim_open_win(float_buf, false, config)
+		vim.wo[float_win].wrap = render == nil
 		local function dismiss()
 			close()
 			if vim.api.nvim_win_is_valid(ann_win) and vim.api.nvim_win_get_buf(ann_win) == ann_buf then
 				vim.api.nvim_set_current_win(ann_win)
 			end
 		end
-		for _, key in ipairs({ "q", "<Esc>", "K" }) do
-			vim.keymap.set("n", key, dismiss, { buffer = float_buf, silent = true, desc = "Close commit info" })
+		for _, lhs in ipairs({ "q", "<Esc>", key }) do
+			vim.keymap.set("n", lhs, dismiss, { buffer = float_buf, silent = true, desc = "Close preview" })
 		end
 		vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
 			buffer = float_buf,
@@ -496,18 +619,26 @@ local function show_commit_float(sha, ann_win, ann_buf, cwd)
 		end
 	end
 
-	process = load_commit_info(sha, cwd, function(lines, err)
-		process = nil
-		if closed then
-			return
+	function hover.refresh(target)
+		hover.cursor = target
+		if process then
+			pcall(process.kill, process, 15)
 		end
-		if not lines then
-			close()
-			vim.notify("Git annotate: " .. err, vim.log.levels.ERROR)
-			return
-		end
-		show(lines)
-	end)
+		process = load(function(lines, err)
+			-- Each jump owns a new cursor table, even when jumping back to the same line.
+			if closed or hover.cursor ~= target then
+				return
+			end
+			process = nil
+			if not lines then
+				close()
+				vim.notify("Git annotate: " .. err, vim.log.levels.ERROR)
+				return
+			end
+			show(lines)
+		end, target[1])
+	end
+	hover.refresh(cursor)
 end
 
 --- Format fancy diffs off the UI thread; retain the original oversized-output guard.
@@ -618,9 +749,86 @@ local function first_change_line(output)
 	end
 end
 
+-- Translate a revision line through zero-context edits into the live buffer.
+-- A removed line lands at the deletion boundary.
+local function buffer_line(line, edits, line_count)
+	local offset = 0
+	for _, edit in ipairs(edits) do
+		local old, removed, new, added = unpack(edit)
+		if line < old or (removed == 0 and line == old) then
+			break
+		elseif line < old + removed then
+			local target = added == 0 and new + 1 or new + math.min(line - old, added - 1)
+			return math.min(target, line_count)
+		end
+		offset = offset + added - removed
+	end
+	return math.max(1, math.min(line + offset, line_count))
+end
+
+local function jump_to_file_hunk(picker, item, action, annotation, cwd, main_win, source_buf)
+	if not item then
+		return
+	end
+	local function source_open()
+		return vim.api.nvim_win_is_valid(main_win) and vim.api.nvim_win_get_buf(main_win) == source_buf
+	end
+	if not source_open() then
+		vim.notify("Git annotate: source file is no longer open", vim.log.levels.WARN)
+		return
+	end
+	local function jump(original, err)
+		if picker.closed or not picker:is_focused() or picker:current() ~= item or not source_open() then
+			return
+		end
+		if err then
+			vim.notify("Git annotate: " .. err, vim.log.levels.ERROR)
+			return
+		end
+		local edits = {}
+		if original then
+			local lines = vim.api.nvim_buf_get_lines(source_buf, 0, -1, false)
+			local current = table.concat(lines, "\n") .. (vim.bo[source_buf].endofline and "\n" or "")
+			local diff = vim.text and vim.text.diff or vim.diff
+			edits = diff(original, current, { result_type = "indices" })
+		end
+		local targets = {}
+		local line_count = vim.api.nvim_buf_line_count(source_buf)
+		for _, selected in ipairs(picker:selected({ fallback = true })) do
+			local line = first_change_line(selected.diff) or selected.pos[1]
+			local row = buffer_line(line, edits, line_count)
+			targets[#targets + 1] = vim.tbl_extend("force", selected, { buf = source_buf, pos = { row, 0 } })
+		end
+		picker.list:set_selected(targets)
+		picker.main = main_win
+		Snacks.picker.actions.jump(picker, item, action)
+	end
+	if is_uncommitted(annotation.sha) then
+		if not vim.bo[source_buf].modified then
+			return jump()
+		end
+		local ok, lines = pcall(vim.fn.readfile, vim.api.nvim_buf_get_name(source_buf), "b")
+		if not ok then
+			return jump(nil, lines)
+		end
+		local original = table.concat(lines, "\n"):gsub("\r\n", "\n")
+		return jump(original)
+	end
+	vim.system(
+		{ "git", "cat-file", "blob", annotation.sha .. ":" .. annotation.path },
+		{ cwd = cwd, text = true },
+		vim.schedule_wrap(function(result)
+			if result.code ~= 0 then
+				return jump(nil, vim.trim(result.stderr))
+			end
+			jump(result.stdout)
+		end)
+	)
+end
+
 --- diff 标题仅展示提交主题，文件路径由 diff 内容展示
 local function commit_preview_title(state)
-	local title = state.working and "Working Tree · Not committed yet" or state.subject or "Loading commit info…"
+	local title = state.working and WORKING_TREE_TITLE or state.subject or "Loading commit info…"
 	return title .. (state.preview_truncated and " [truncated]" or "")
 end
 
@@ -1155,8 +1363,8 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 		end, state.cwd)
 	end
 
-	local function keys()
-		return {
+	local function keys(pane)
+		local mappings = {
 			["<CR>"] = { "confirm", mode = { "i", "n" }, desc = "Open file in working tree" },
 			["o"] = { "confirm", mode = "n", desc = "Open file in working tree" },
 			["f"] = { "git_annotate_filter", mode = "n", desc = "Filter commit history" },
@@ -1166,11 +1374,14 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 				mode = { "i", "n" },
 				desc = "Toggle files/input and diff preview",
 			},
-			["n"] = { "git_annotate_older", mode = "n", desc = "Show older commit" },
-			["p"] = { "git_annotate_newer", mode = "n", desc = "Show newer commit" },
 			["K"] = { "git_annotate_info", mode = "n", desc = "Show complete commit info" },
-			["O"] = { "git_annotate_browse", mode = "n", desc = "Open commit in browser" },
+			["O"] = { "git_annotate_browse", mode = "n", desc = "Open pull request or commit" },
 		}
+		if pane ~= "preview" then
+			mappings.n = { "git_annotate_older", mode = "n", desc = "Show older commit" }
+			mappings.p = { "git_annotate_newer", mode = "n", desc = "Show newer commit" }
+		end
+		return mappings
 	end
 
 	return {
@@ -1286,15 +1497,18 @@ local function change_picker_opts(state, ann_win, main_win, source_file)
 			end
 			vim.schedule(function()
 				local target = state.opened_file and main_win or ann_win
-				if vim.api.nvim_win_is_valid(target) then
+				if
+					vim.api.nvim_win_is_valid(target)
+					and vim.api.nvim_win_get_tabpage(target) == vim.api.nvim_get_current_tabpage()
+				then
 					vim.api.nvim_set_current_win(target)
 				end
 			end)
 		end,
 		win = {
-			input = { keys = keys() },
-			list = { keys = keys() },
-			preview = { keys = keys() },
+			input = { keys = keys("input") },
+			list = { keys = keys("list") },
+			preview = { keys = keys("preview") },
 		},
 	}
 end
@@ -1410,6 +1624,14 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 		vim.api.nvim_win_set_cursor(main_win, { lnum, 0 })
 	end
 
+	local function jump_to_hunk(lnum)
+		jump_to(lnum)
+		local hover = hover_requests[ann_buf]
+		if hover and hover.key == "p" then
+			hover.refresh(vim.api.nvim_win_get_cursor(ann_win))
+		end
+	end
+
 	local function cur_sha()
 		local lnum = vim.api.nvim_win_get_cursor(ann_win)[1]
 		return annotations[lnum] and annotations[lnum].sha
@@ -1431,7 +1653,7 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 			i = i + 1
 		end
 		if i <= #annotations then
-			jump_to(i)
+			jump_to_hunk(i)
 		end
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Next hunk of same commit" })
 
@@ -1449,7 +1671,7 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 			i = i - 1
 		end
 		if i >= 1 and annotations[i].sha == sha then
-			jump_to(i)
+			jump_to_hunk(i)
 		end
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Prev hunk of same commit" })
 
@@ -1485,12 +1707,78 @@ local function setup_keymaps(ann_buf, ann_win, main_win, annotations, cwd)
 
 	-- K: 浮动窗口展示简要 commit 信息
 	vim.keymap.set("n", "K", function()
-		show_commit_float(cur_sha(), ann_win, ann_buf, cwd)
+		show_sidebar_float("K", ann_win, ann_buf, function(done)
+			return load_commit_info(cur_sha(), cwd, done)
+		end)
 	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Show commit info (float)" })
+
+	vim.keymap.set("n", "p", function()
+		local ok, diff = pcall(require, "snacks.picker.util.diff")
+		if not ok then
+			vim.notify("Git annotate: p requires snacks.nvim", vim.log.levels.WARN)
+			return
+		end
+		local annotation = annotations[vim.api.nvim_win_get_cursor(ann_win)[1]]
+		show_sidebar_float("p", ann_win, ann_buf, function(done, row)
+			return load_hunk(annotations[row], cwd, done)
+		end, function(buf, lines)
+			diff.render(buf, vim.api.nvim_create_namespace("GitAnnotateHunk"), lines, {})
+		end, annotation_title(annotation))
+	end, { silent = true, buffer = ann_buf, desc = "Preview annotated hunk" })
+
+	vim.keymap.set("n", "f", function()
+		local ok, snacks = pcall(require, "snacks")
+		if not ok or not snacks.picker then
+			vim.notify("Git annotate: f requires snacks.nvim", vim.log.levels.WARN)
+			return
+		end
+		local annotation = annotations[vim.api.nvim_win_get_cursor(ann_win)[1]]
+		local command = annotated_diff_command(annotation)
+		local source_buf = vim.api.nvim_win_get_buf(main_win)
+		local keys = {
+			["<CR>"] = { "confirm", mode = { "n", "i" }, desc = "Jump to change" },
+			o = { "confirm", mode = "n", desc = "Jump to change" },
+		}
+		snacks.picker.pick({
+			title = annotation_title(annotation),
+			cwd = cwd,
+			finder = "diff",
+			cmd = command[1],
+			args = vim.list_slice(command, 2),
+			format = "git_status",
+			preview = "diff",
+			focus = "list",
+			main = { file = false },
+			win = { input = { keys = keys }, list = { keys = keys }, preview = { keys = keys } },
+			confirm = function(picker, item, action)
+				jump_to_file_hunk(picker, item, action, annotation, cwd, main_win, source_buf)
+			end,
+			on_show = function(picker)
+				local function select_hunk()
+					if picker.closed then
+						return
+					end
+					local index = 1
+					for item, i in picker:iter() do
+						if item.pos[1] > annotation.orig_line then
+							break
+						end
+						index = i
+					end
+					picker.list:view(index)
+				end
+				if picker.matcher.task:running() then
+					picker.matcher.task:on("done", vim.schedule_wrap(select_hunk))
+				else
+					select_hunk()
+				end
+			end,
+		})
+	end, { silent = true, buffer = ann_buf, desc = "Show all hunks for this file and commit" })
 
 	vim.keymap.set("n", "O", function()
 		open_commit_browser(cur_sha(), main_win)
-	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Open commit in browser" })
+	end, { noremap = true, silent = true, buffer = ann_buf, desc = "Open pull request or commit" })
 
 	-- d: 用 Snacks picker 展示变更文件列表与 diff
 	vim.keymap.set("n", "d", function()

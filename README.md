@@ -40,8 +40,10 @@ For LazyVim, add this entry to the plugin's `keys`:
 |---|---|
 | `q` / `<Esc>` | Close the sidebar |
 | `K` | Show commit information; press again to focus the float, then `q` / `<Esc>` / `K` to close and return |
-| `O` | Open the current line's commit in the default browser (requires Snacks) |
+| `O` | Open the GitHub PR for the current line, falling back to the commit page (requires Snacks) |
 | `d` | Show changed files, repository commit history and per-file diff in Snacks |
+| `p` | Preview the current hunk with its commit subject in the float title. Uncommitted lines show the working-tree hunk. The preview follows `[[` / `]]` in the sidebar. Press `p` again to scroll it |
+| `f` | List this commit’s hunks in the file, or working-tree hunks for an uncommitted line. The list opens on the current hunk in normal mode. Press `<Enter>` or `o` to jump to the selected change in the source buffer, or dismiss to return to the sidebar |
 | `]]` | Jump to the next occurrence of the same commit in the file |
 | `[[` | Jump to the previous occurrence of the same commit in the file |
 | `]c` | Jump to the next commit's first occurrence (skip repeated commit blocks) |
@@ -49,7 +51,7 @@ For LazyVim, add this entry to the plugin's `keys`:
 
 > `d` requires [snacks.nvim](https://github.com/folke/snacks.nvim). The picker starts on the current file when possible and previews the selected file's diff. Untracked files are also available through their per-file preview.
 
-In the picker's file list, input or diff preview, press `O` in normal mode to open the selected commit in the default browser. After navigating with `p`/`n`, it opens the newly selected commit and keeps the picker open. Uncommitted changes show a warning because they have no commit page. Snacks offers a remote selector when the repository has multiple remotes.
+In the picker's file list, input or diff preview, press `O` in normal mode to browse the selected history entry and keep the picker open. For github.com remotes, `O` uses `gh` to open the first associated PR. If no PR is found or the lookup fails, it opens the commit page. Private repositories require `gh` to be authenticated with repository access. Uncommitted changes show a warning. Snacks offers a remote selector when the repository has multiple remotes.
 
 In the detail view, press `<CR>` or normal-mode `o` to open the selected file's current working-tree version in the source window and close the viewer. If the file no longer exists, a message shows its path and the detail view stays open.
 
@@ -59,7 +61,7 @@ Press `<C-o>` in the file list or search input to focus the diff preview, then p
 
 The file list title shows the author and local time, using `shenyfg  Today 16:51` for today or `shenyfg  2026/8/25, 15:23` for other dates. The diff preview title shows the commit subject while you switch files or scroll. File paths appear in the diff content instead of being repeated in the title. Press `K` in the file list or diff preview to see the SHA, author, date and full commit message, scroll with Vim movement keys, and press `q` / `<Esc>` / `K` to return to the previous pane. Uncommitted changes show `Working Tree · Not committed yet`. The picker uses a dedicated layout, stacking the file list above the diff in narrow windows.
 
-Repository history appears below the changed files, including commits reachable from branches and tags. Entries use the default Snacks Git log formatting: commit icon, abbreviated SHA, human-readable committer date, subject and author, with the same highlighting. Newest commits appear at the top. The current commit is highlighted and scrolled into view. A fixed `▶` before the commit icon identifies the commit originally opened; only the row highlight follows the commit being viewed. Press `p` in the file list or diff preview to select a newer history entry, or `n` for an older one; changed files, diff and `K` information update together. Switching commits clears the file search and tries to select the original annotated file. The history pane follows the selection automatically. When opened from an uncommitted line, a `Working Tree` entry remains at the top so you can return to working tree changes.
+Repository history appears below the changed files, including commits reachable from branches and tags. Entries use the default Snacks Git log formatting: commit icon, abbreviated SHA, human-readable committer date, subject and author, with the same highlighting. Newest commits appear at the top. The current commit is highlighted and scrolled into view. A fixed `▶` before the commit icon identifies the commit originally opened; only the row highlight follows the commit being viewed. In the diff preview, `n` repeats the last search. In the file list or input, press `p` in normal mode to select a newer history entry, or `n` for an older one; changed files, diff and `K` information update together. Switching commits clears the file search and tries to select the original annotated file. The history pane follows the selection automatically. When opened from an uncommitted line, a `Working Tree` entry remains at the top so you can return to working tree changes.
 
 ## Large commit protection
 
@@ -72,4 +74,4 @@ Repository history appears below the changed files, including commits reachable 
 
 - Neovim 0.10+
 - Git available in `$PATH`
-- [snacks.nvim](https://github.com/folke/snacks.nvim) (optional, required for `d` and `O`)
+- [snacks.nvim](https://github.com/folke/snacks.nvim) (optional, required for `d`, `p`, `f` and `O`)

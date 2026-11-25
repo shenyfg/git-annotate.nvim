@@ -157,6 +157,7 @@ vim.cmd.cd('/tmp')
 open()
 key('K')
 wait_for(function() return windows() == 3 end)
+vim.cmd('normal! j')
 vim.api.nvim_exec_autocmds('CursorMoved', {buffer=0})
 assert(windows() == 2)
 ''',
@@ -304,6 +305,7 @@ open()
 local before = #vim.api.nvim_list_bufs()
 local release = hold_exits()
 key('K')
+vim.cmd('normal! j')
 vim.api.nvim_exec_autocmds('CursorMoved', {buffer=0})
 release()
 assert(windows() == 2 and #vim.api.nvim_list_bufs() == before)
@@ -639,14 +641,20 @@ local function close_picker(picker)
   picker:close()
   wait_for(function() return sidebar_open() and windows() == 2 end)
 end
-local function capture_browser()
-  local urls, system = {}, vim.fn.system
+local function capture_browser(lookup, remote)
+  local urls, system, spawn = {}, vim.fn.system, vim.system
   vim.ui.open = function(url) table.insert(urls, url) end
+  vim.system = function(command, opts, callback)
+    if command[1] ~= 'gh' then return spawn(command, opts, callback) end
+    assert(command[2] == 'api' and command[3] == '--hostname' and command[4] == 'github.com')
+    local sha = assert(command[5]:match('^repos/example/project/commits/(%x+)/pulls%?per_page=1$'))
+    callback(lookup(sha))
+  end
   vim.fn.system = function(command)
     if type(command) == 'table' and command[1] == 'git' and command[2] == '-C' then
       assert(command[3] == REPO, 'browser resolved the wrong repository')
       if command[4] == 'remote' then
-        return 'origin\tgit@github.com:example/project.git (fetch)\n'
+        return 'origin\t' .. (remote or 'git@github.com:example/project.git') .. ' (fetch)\n'
       end
     end
     return system(command)
@@ -671,6 +679,147 @@ end
 '''
 
 SNACKS_CASES = {
+    'closing Git log in another tab keeps focus in the code tab': r'''
+local picker = direct_log()
+diff_loaded(picker)
+vim.cmd.tabnew()
+local code_win = vim.api.nvim_get_current_win()
+picker:close()
+wait_for(function() return not picker.layout:valid() end)
+assert(vim.api.nvim_get_current_win() == code_win)
+''',
+    'p titles the blamed hunk and f lists all hunks for its file and revision in normal mode': r'''
+local dir = vim.fn.tempname()
+local function run(args)
+  local result = vim.system(args, { cwd = dir, text = true }):wait()
+  assert(result.code == 0, result.stderr)
+end
+vim.fn.mkdir(dir, 'p')
+run({'git', 'init', '-q'})
+local old_path, new_path = '旧 "name".txt', 'renamed.txt'
+local lines = {}
+for i = 1, 40 do lines[i] = 'original line ' .. i end
+vim.fn.writefile(lines, dir .. '/' .. old_path)
+local function snapshot(message)
+  run({'git', 'add', '.'})
+  run({'git', '-c', 'user.name=Test', '-c', 'user.email=test@example.org',
+    '-c', 'commit.gpgsign=false', 'commit', '-qm', message})
+end
+snapshot('root')
+lines[2], lines[30] = 'other committed hunk', 'selected committed hunk'
+vim.fn.writefile(lines, dir .. '/' .. old_path)
+vim.fn.writefile({'unrelated file'}, dir .. '/other.txt')
+snapshot('two hunks')
+run({'git', 'mv', old_path, new_path})
+for i = 1, 12 do table.insert(lines, 1, 'working insertion') end
+lines[50] = 'selected working hunk'
+vim.fn.writefile(lines, dir .. '/' .. new_path)
+vim.cmd.edit(dir .. '/' .. new_path)
+open()
+local sidebar = vim.api.nvim_get_current_win()
+local function preview(row, title)
+  vim.api.nvim_win_set_cursor(sidebar, {row, 0})
+  key('p')
+  wait_for(function() return windows() == 3 end)
+  assert(sidebar_open())
+  key('p')
+  assert(vim.api.nvim_win_get_config(0).title[1][1] == title)
+  local content = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
+  key('q')
+  assert(vim.api.nvim_get_current_win() == sidebar and windows() == 2)
+  return content
+end
+local committed = preview(42, 'two hunks')
+assert(committed:find('original line 30', 1, true) and committed:find(lines[42], 1, true), committed)
+assert(not committed:find('other committed hunk', 1, true))
+local working_title = 'Working Tree · Not committed yet'
+local working = preview(50, working_title)
+assert(working:find('original line 38', 1, true) and working:find(lines[50], 1, true), working)
+assert(not working:find('working insertion', 1, true))
+assert(preview(13, 'root'):find('original line 1', 1, true))
+vim.api.nvim_win_set_cursor(sidebar, {14, 0})
+key(']]')
+assert(vim.api.nvim_win_get_cursor(sidebar)[1] == 42 and windows() == 2)
+key('p')
+wait_for(function() return windows() == 3 end)
+local float = assert(vim.iter(vim.api.nvim_list_wins()):find(function(win)
+  return vim.api.nvim_win_get_config(win).relative ~= ''
+end))
+local float_buf = vim.api.nvim_win_get_buf(float)
+local function expect_hunk(row, text)
+  wait_for(function()
+    return table.concat(vim.api.nvim_buf_get_lines(float_buf, 0, -1, false), '\n'):find(text, 1, true)
+  end)
+  assert(vim.api.nvim_win_get_cursor(sidebar)[1] == row and vim.api.nvim_get_current_win() == sidebar)
+  assert(windows() == 3 and vim.api.nvim_win_get_buf(float) == float_buf)
+end
+key('[[')
+vim.api.nvim_exec_autocmds('CursorMoved', {buffer=0})
+expect_hunk(14, 'other committed hunk')
+local system, release = vim.system, hold_exits()
+key(']]')
+key('[[')
+key(']]')
+vim.api.nvim_exec_autocmds('CursorMoved', {buffer=0})
+for _ = 1, 3 do release() end
+vim.system = system
+expect_hunk(42, 'selected committed hunk')
+key(']]') -- last hunk
+expect_hunk(42, 'selected committed hunk')
+vim.cmd('normal! j')
+vim.api.nvim_exec_autocmds('CursorMoved', {buffer=0})
+assert(windows() == 2)
+vim.cmd.cd('/tmp')
+local function file_hunks(row, title, first, selected, count, exit_key)
+  assert(vim.api.nvim_get_current_win() == sidebar)
+  vim.api.nvim_win_set_cursor(sidebar, {row, 0})
+  key('f')
+  local picker
+  wait_for(function()
+    picker = Snacks.picker.get()[1]
+    return picker and picker:current_win() == 'list' and picker:current()
+      and picker:current().diff:find(selected, 1, true)
+  end)
+  assert(vim.fn.mode() == 'n' and picker.title == title)
+  assert(#picker:items() == count and picker:items()[1].diff:find(first, 1, true))
+  wait_for(function() return picker.preview.win:text():find(selected, 1, true) end)
+  if count > 1 then
+    key('k')
+    wait_for(function() return picker.preview.win:text():find(first, 1, true) end)
+  end
+  if exit_key == '<Esc>' then picker:focus('preview') end
+  key(exit_key)
+  wait_for(function() return vim.api.nvim_get_current_win() == sidebar and windows() == 2 end)
+  assert(vim.api.nvim_win_get_cursor(sidebar)[1] == row)
+end
+file_hunks(42, 'two hunks', 'other committed hunk', 'selected committed hunk', 2, '<Esc>')
+file_hunks(50, working_title, 'working insertion', 'selected working hunk', 2, 'q')
+file_hunks(13, 'root', 'original line 1', 'original line 40', 1, 'q')
+local function jump(row, lhs, expected, previous, pane)
+  vim.api.nvim_set_current_win(sidebar)
+  vim.api.nvim_win_set_cursor(sidebar, {row, 0})
+  key('f')
+  local picker
+  wait_for(function()
+    picker = Snacks.picker.get()[1]
+    return picker and picker:current_win() == 'list' and picker:current()
+      and picker:current().diff:find(lines[row], 1, true)
+  end)
+  if previous then key('k') end
+  if pane then picker:focus(pane) end
+  key(lhs)
+  wait_for(function() return windows() == 2 and vim.api.nvim_buf_get_name(0) == dir .. '/' .. new_path end)
+  assert(vim.fn.line('.') == expected, ('expected row %d, got %d'):format(expected, vim.fn.line('.')))
+end
+jump(50, '<CR>', 50)
+jump(42, 'o', 14, true)
+vim.api.nvim_buf_set_lines(0, 0, 0, false, {'unsaved insertion'})
+jump(42, '<CR>', 43, false, 'preview')
+jump(50, 'o', 51)
+vim.api.nvim_buf_set_lines(0, 42, 43, false, {})
+jump(42, 'o', 43)
+assert(vim.api.nvim_get_current_line() == 'original line 31')
+''',
     'j k n and p move immediately while the real preview worker is busy': r'''
 local renderer = require('git_annotate.preview')
 local new, session = renderer.new
@@ -1019,6 +1168,7 @@ assert(vim.api.nvim_buf_call(picker.input.win.buf, function()
   return vim.fn.maparg('<C-t>', 'i', false, true).callback
 end))
 key('<C-T>')
+picker:focus('list')
 local head = selected_commit(picker)
 key('n')
 wait_for(function() return selected_commit(picker) ~= head end)
@@ -1251,8 +1401,11 @@ assert(notices[#notices]:find('not a git repository', 1, true))
 assert(#Snacks.picker.get() == 0 and windows() == 1)
 ''',
     'O browses the sidebar line commit from the source repository and rejects uncommitted lines': r'''
-local urls = capture_browser()
 local older, head = git({'rev-parse', 'HEAD~1'}), git({'rev-parse', 'HEAD'})
+local pr = 'https://github.com/example/project/pull/11'
+local urls = capture_browser(function(sha)
+  return {code = 0, stdout = sha == older and pr .. '\n' or ''}
+end)
 M._open_sidebar({
   {sha = older, text = 'Older commit', author_time = os.time()},
   {sha = head, text = 'Head commit', author_time = os.time()},
@@ -1264,7 +1417,8 @@ local sidebar = vim.api.nvim_get_current_win()
 for row, sha in ipairs({older, head}) do
   vim.api.nvim_win_set_cursor(sidebar, {row, 0})
   key('O')
-  assert(urls[row] == 'https://github.com/example/project/commit/' .. sha)
+  wait_for(function() return urls[row] end)
+  assert(urls[row] == (row == 1 and pr or 'https://github.com/example/project/commit/' .. sha))
   assert(vim.api.nvim_get_current_win() == sidebar and sidebar_open())
 end
 vim.api.nvim_win_set_cursor(sidebar, {3, 0})
@@ -1272,8 +1426,34 @@ key('O')
 assert(#urls == 2 and notices[#notices]:find('uncommitted changes', 1, true))
 assert(vim.fn.getcwd() == cwd, vim.fn.getcwd())
 ''',
+    'O falls back when gh fails to run or GitHub returns an error': r'''
+open()
+local calls = 0
+local urls = capture_browser(function()
+  calls = calls + 1
+  if calls == 1 then error('ENOENT') end
+  return {code = 1, stderr = 'HTTP 403'}
+end)
+for i = 1, 2 do
+  key('O')
+  wait_for(function() return urls[i] end)
+  assert(urls[i]:match('^https://github%.com/example/project/commit/%x+$'))
+end
+assert(calls == 2)
+''',
+    'O opens non-GitHub remotes without a PR lookup': r'''
+open()
+local calls = 0
+local urls = capture_browser(function() calls = calls + 1 end, 'git@gitlab.com:example/project.git')
+key('O')
+assert(calls == 0 and urls[1]:match('^https://gitlab%.com/example/project/%-/commit/%x+$'))
+''',
     'O in picker panes follows the selected history commit and preserves the picker': r'''
-local urls = capture_browser()
+local initial_sha
+local pr = 'https://github.com/example/project/pull/11'
+local urls = capture_browser(function(sha)
+  return {code = 0, stdout = sha == initial_sha and pr or ''}
+end)
 local picker = open_picker(string.rep('0', 40))
 history_loaded(picker)
 key('O')
@@ -1281,21 +1461,24 @@ assert(#urls == 0 and notices[#notices]:find('uncommitted changes', 1, true))
 key('n')
 diff_loaded(picker)
 local initial = selected_commit(picker)
-local sha = git({'rev-parse', initial})
+initial_sha = git({'rev-parse', initial})
 vim.cmd.cd('/tmp')
 local cwd = vim.fn.getcwd()
 for i, pane in ipairs({'list', 'input', 'preview'}) do
   picker:focus(pane)
   vim.cmd.stopinsert()
   key('O')
-  assert(urls[i] == 'https://github.com/example/project/commit/' .. sha)
+  wait_for(function() return urls[i] end)
+  assert(urls[i] == pr)
   assert(not picker.closed and picker:current_win() == pane)
 end
 assert(vim.fn.getcwd() == cwd, vim.fn.getcwd())
+picker:focus('list')
 key('n')
 wait_for(function() return selected_commit(picker) ~= initial end)
 diff_loaded(picker)
 key('O')
+wait_for(function() return urls[4] end)
 assert(urls[4] == 'https://github.com/example/project/commit/' .. git({'rev-parse', selected_commit(picker)}))
 close_picker(picker)
 ''',
@@ -1455,6 +1638,16 @@ wait_for(function() return vim.api.nvim_buf_get_lines(0, 0, -1, false)[1]:find(o
 assert(vim.api.nvim_buf_get_lines(0, 0, -1, false)[5] == subject)
 key('q')
 picker:focus('preview')
+assert(vim.fn.maparg('p', 'n') == '')
+vim.api.nvim_win_set_cursor(0, {1, 0})
+local next_line = vim.fn.search('^.', 'nW')
+assert(next_line > 1)
+vim.fn.setreg('/', '^.')
+vim.cmd('silent normal n')
+assert(vim.api.nvim_win_get_cursor(0)[1] == next_line)
+assert(selected_commit(picker) == older:sub(1, 8))
+picker:focus('input')
+vim.cmd.stopinsert()
 key('p')
 diff_loaded(picker)
 assert(selected_commit(picker) == commits[index]:sub(1, 8))
